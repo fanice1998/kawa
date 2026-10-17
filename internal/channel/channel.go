@@ -22,6 +22,11 @@ type Channel interface {
 	Send(ctx context.Context, recipient string, text string) error
 }
 
+// TypingChannel can be implemented by channels (like Telegram) that support a continuous "typing..." indicator.
+type TypingChannel interface {
+	StartTyping(ctx context.Context, recipient string) func()
+}
+
 // Router manages multiple active communication channels and routes messages between them and the Agent.
 type Router struct {
 	mu       sync.RWMutex
@@ -69,4 +74,18 @@ func (r *Router) Send(ctx context.Context, channelName, recipient, text string) 
 		return fmt.Errorf("channel %q not registered", channelName)
 	}
 	return ch.Send(ctx, recipient, text)
+}
+
+// StartTyping starts a continuous "typing..." indicator on channels that support it and returns a stop function.
+func (r *Router) StartTyping(ctx context.Context, channelName, recipient string) func() {
+	r.mu.RLock()
+	ch, ok := r.channels[channelName]
+	r.mu.RUnlock()
+	if !ok {
+		return func() {}
+	}
+	if tc, ok := ch.(TypingChannel); ok {
+		return tc.StartTyping(ctx, recipient)
+	}
+	return func() {}
 }

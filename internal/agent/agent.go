@@ -114,7 +114,11 @@ func (a *Agent) handleInbound(ctx context.Context, msg channel.InboundMessage) {
 
 	a.recordAction(fmt.Sprintf("Received message from %s:%s (%s)", msg.ChannelName, msg.SenderID, truncateLog(msg.Text, 40)))
 
+	// Keep "typing..." status continuously active every 4s until ProcessMessage finishes
+	stopTyping := a.router.StartTyping(ctx, msg.ChannelName, msg.SenderID)
 	reply, err := a.ProcessMessage(ctx, msg.ChannelName, msg.SenderID, msg.Text)
+	stopTyping()
+
 	if err != nil {
 		log.Error().Err(err).Str("channel", msg.ChannelName).Msg("Failed to process message")
 		reply = fmt.Sprintf("⚠️ 執行發生錯誤: %v", err)

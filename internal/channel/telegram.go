@@ -115,9 +115,6 @@ func (t *TelegramChannel) Start(ctx context.Context, inbound chan<- InboundMessa
 				continue
 			}
 
-			// Immediately send "typing..." indicator so user sees Kawa is working
-			go t.sendTypingAction(ctx, strconv.FormatInt(chatID, 10))
-
 			inbound <- InboundMessage{
 				ChannelName: t.Name(),
 				SenderID:    strconv.FormatInt(chatID, 10),
@@ -125,6 +122,26 @@ func (t *TelegramChannel) Start(ctx context.Context, inbound chan<- InboundMessa
 			}
 		}
 	}
+}
+
+// StartTyping sends `typing` action immediately and repeats every 4 seconds until the returned stop func is called.
+// (Telegram's typing status expires after 5 seconds unless refreshed.)
+func (t *TelegramChannel) StartTyping(ctx context.Context, recipient string) func() {
+	typingCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		t.sendTypingAction(typingCtx, recipient)
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-typingCtx.Done():
+				return
+			case <-ticker.C:
+				t.sendTypingAction(typingCtx, recipient)
+			}
+		}
+	}()
+	return cancel
 }
 
 func (t *TelegramChannel) sendTypingAction(ctx context.Context, chatID string) {
