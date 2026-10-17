@@ -15,8 +15,8 @@ import (
 )
 
 var (
-	toolCallTagRe  = regexp.MustCompile(`(?is)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
-	jsonCodeFence  = regexp.MustCompile("(?is)```(?:json)?\\s*(\\{.*?\\})\\s*```")
+	toolCallTagRe = regexp.MustCompile(`(?is)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
+	jsonCodeFence = regexp.MustCompile("(?is)```(?:json)?\\s*(\\{.*?\\})\\s*```")
 )
 
 type OllamaProvider struct {
@@ -82,19 +82,18 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 			Role:    string(m.Role),
 			Content: m.Content,
 		}
-		for _, tc := range m.ToolCalls {
-			rawArgs := json.RawMessage(tc.Arguments)
-			if !json.Valid(rawArgs) {
-				rawArgs = json.RawMessage("{}")
+		if m.Role == RoleTool {
+			// Qwen2.5-Coder & Hermes process tool results fastest when Role is "tool" with clean content
+			if m.ToolName != "" && !strings.HasPrefix(strings.TrimSpace(om.Content), "<tool_response>") {
+				om.Content = fmt.Sprintf("<tool_response>\nTool `%s` output:\n%s\n</tool_response>\n請根據以上工具執行結果，直接用繁體中文回答使用者的問題，不要再輸出 JSON。", m.ToolName, m.Content)
 			}
-			var call ollamaToolCall
-			call.Function.Name = tc.Name
-			call.Function.Arguments = rawArgs
-			om.ToolCalls = append(om.ToolCalls, call)
-			// Many Ollama models (like qwen2.5-coder) expect their own prior tool call in Content when re-reading history
-			if strings.TrimSpace(om.Content) == "" {
-				om.Content = fmt.Sprintf(`{"name": %q, "arguments": %s}`, tc.Name, string(rawArgs))
+		} else if len(m.ToolCalls) > 0 && strings.TrimSpace(om.Content) == "" {
+			tc := m.ToolCalls[0]
+			rawArgs := tc.Arguments
+			if strings.TrimSpace(rawArgs) == "" {
+				rawArgs = "{}"
 			}
+			om.Content = fmt.Sprintf("<tool_call>\n{\"name\": %q, \"arguments\": %s}\n</tool_call>", tc.Name, rawArgs)
 		}
 		msgs = append(msgs, om)
 	}
@@ -158,8 +157,7 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		})
 	}
 
-	// Fallback: models like qwen2.5-coder often emit `{"name": "tool", "arguments": {...}}`
-	// directly inside `message.content` instead of `message.tool_calls`.
+	// Extract Hermes `<tool_call>{...}</tool_call>`, fenced JSON, or embedded JSON tool calls anywhere in content
 	if len(out.ToolCalls) == 0 && len(validTools) > 0 && strings.TrimSpace(out.Content) != "" {
 		if cleanText, inlineCalls := extractInlineToolCalls(out.Content, validTools); len(inlineCalls) > 0 {
 			out.Content = cleanText
@@ -170,11 +168,12 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	return out, nil
 }
 
-// extractInlineToolCalls detects JSON tool calls emitted inside `message.content` by models like qwen2.5-coder.
+// extractInlineToolCalls detects Hermes `<tool_call>` tags, fenced JSON, or any balanced JSON object
+// inside `content` that references a valid tool name.
 func extractInlineToolCalls(content string, validTools map[string]bool) (string, []ToolCall) {
 	trimmed := strings.TrimSpace(content)
 
-	// 1. Check `<tool_call>{...}</tool_call>`
+	// 1. Check Hermes `<tool_call>{...}</tool_call>`
 	if matches := toolCallTagRe.FindAllStringSubmatch(trimmed, -1); len(matches) > 0 {
 		var calls []ToolCall
 		for i, m := range matches {
@@ -202,26 +201,85 @@ func extractInlineToolCalls(content string, validTools map[string]bool) (string,
 		}
 	}
 
-	// 3. Check raw JSON object `{"name": "...", "arguments": {...}}`
-	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
-		if tc, ok := parseSingleToolJSON(trimmed, 1, validTools); ok {
-			return "", []ToolCall{tc}
+	// 3. Scan for any balanced JSON object `{...}` inside the text (handles mixed text + JSON)
+	candidates := extractBalancedJSONObjects(trimmed)
+	var calls []ToolCall
+	clean := trimmed
+	for i, cand := range candidates {
+		if tc, ok := parseSingleToolJSON(cand, i+1, validTools); ok {
+			calls = append(calls, tc)
+			clean = strings.TrimSpace(strings.Replace(clean, cand, "", 1))
 		}
+	}
+	if len(calls) > 0 {
+		return clean, calls
 	}
 
 	return content, nil
 }
 
+// extractBalancedJSONObjects finds top-level `{...}` substrings in s, respecting string quotes and escapes.
+func extractBalancedJSONObjects(s string) []string {
+	var results []string
+	depth := 0
+	start := -1
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if ch == '{' {
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		} else if ch == '}' {
+			if depth > 0 {
+				depth--
+				if depth == 0 && start != -1 {
+					results = append(results, s[start:i+1])
+					start = -1
+				}
+			}
+		}
+	}
+	return results
+}
+
 func parseSingleToolJSON(raw string, idx int, validTools map[string]bool) (ToolCall, bool) {
 	var parsed struct {
 		Name       string          `json:"name"`
+		Tool       string          `json:"tool"`
+		Function   string          `json:"function"`
 		Arguments  json.RawMessage `json:"arguments"`
 		Parameters json.RawMessage `json:"parameters"`
+		Args       json.RawMessage `json:"args"`
 	}
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return ToolCall{}, false
 	}
 	name := strings.TrimSpace(parsed.Name)
+	if name == "" {
+		name = strings.TrimSpace(parsed.Tool)
+	}
+	if name == "" {
+		name = strings.TrimSpace(parsed.Function)
+	}
 	if name == "" || !validTools[name] {
 		return ToolCall{}, false
 	}
@@ -230,9 +288,11 @@ func parseSingleToolJSON(raw string, idx int, validTools map[string]bool) (ToolC
 		args = parsed.Parameters
 	}
 	if len(args) == 0 {
+		args = parsed.Args
+	}
+	if len(args) == 0 {
 		args = json.RawMessage("{}")
 	}
-	// If arguments was encoded as a JSON string inside JSON, unwrap it
 	if len(args) > 0 && args[0] == '"' {
 		var unquoted string
 		if err := json.Unmarshal(args, &unquoted); err == nil && json.Valid([]byte(unquoted)) {

@@ -43,7 +43,7 @@ state_dir = "./.kawa"
 [llm.ollama]
 base_url = "http://127.0.0.1:11434"
 model = "qwen2.5-coder:14b"
-timeout_sec = 120
+timeout_sec = 300
 
 [llm.xai_grok]
 base_url = "https://api.x.ai/v1"

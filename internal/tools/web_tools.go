@@ -97,8 +97,8 @@ func (t *WebSearchTool) searchDuckDuckGo(ctx context.Context, query string) (str
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	page := string(body)
 
-	links := ddgResultRe.FindAllStringSubmatch(page, 8)
-	snippets := ddgSnippetRe.FindAllStringSubmatch(page, 8)
+	links := ddgResultRe.FindAllStringSubmatch(page, 5)
+	snippets := ddgSnippetRe.FindAllStringSubmatch(page, 5)
 
 	if len(links) == 0 {
 		return fmt.Sprintf("No search results found for %q.", query), nil
@@ -117,6 +117,10 @@ func (t *WebSearchTool) searchDuckDuckGo(ctx context.Context, query string) (str
 		var snippet string
 		if i < len(snippets) {
 			snippet = CleanHTMLToText(snippets[i][1])
+			if len([]rune(snippet)) > 160 {
+				r := []rune(snippet)
+				snippet = string(r[:160]) + "..."
+			}
 		}
 		sb.WriteString(fmt.Sprintf("%d. %s\n   URL: %s\n", i+1, title, rawHref))
 		if snippet != "" {

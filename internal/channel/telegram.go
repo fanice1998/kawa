@@ -115,12 +115,32 @@ func (t *TelegramChannel) Start(ctx context.Context, inbound chan<- InboundMessa
 				continue
 			}
 
+			// Immediately send "typing..." indicator so user sees Kawa is working
+			go t.sendTypingAction(ctx, strconv.FormatInt(chatID, 10))
+
 			inbound <- InboundMessage{
 				ChannelName: t.Name(),
 				SenderID:    strconv.FormatInt(chatID, 10),
 				Text:        strings.TrimSpace(u.Message.Text),
 			}
 		}
+	}
+}
+
+func (t *TelegramChannel) sendTypingAction(ctx context.Context, chatID string) {
+	payload, _ := json.Marshal(map[string]any{
+		"chat_id": chatID,
+		"action":  "typing",
+	})
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendChatAction", t.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := t.client.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
 	}
 }
 

@@ -1,27 +1,37 @@
 ---
 name: self_improvement
-description: Step-by-step guide for Kawa to safely inspect its own Go source code, write new features/tools, verify in the Seatbelt sandbox, and propose self-evolution.
+description: Step-by-step guide for Kawa to safely inspect its own Go source code, develop new tools/features in internal/tools/custom_tools.go, verify in the Seatbelt sandbox, and propose self-evolution.
 ---
 
-# Kawa Self-Improvement & Code Evolution Skill
+# Kawa Self-Improvement & Autonomous Feature Development Skill
 
-When the user asks you to add a new feature, create a new tool, optimize existing code, or fix a bug in yourself, follow this strict safety workflow:
+When the user asks you to develop a new feature, create a new tool, optimize existing code, or fix a bug in yourself, follow this strict workflow:
 
 ## Step 1: Inspect Current Source Code
-1. Use `list_dir` with `{"scope": "source", "path": "."}` or `{"scope": "source", "path": "internal/tools"}` to explore the codebase structure.
-2. Use `read_file` with `{"scope": "source", "path": "internal/tools/tool.go"}` (and related files) to understand interfaces and conventions.
+1. Call `read_file` with `{"scope": "source", "path": "internal/tools/custom_tools.go"}` and `{"scope": "source", "path": "internal/tools/tool.go"}`.
+2. Notice that `RegisterCustomTools(reg *Registry, deps CustomToolDeps)` in `internal/tools/custom_tools.go` is your dedicated plug-and-play registration point! You do NOT need to modify `cmd/kawa/main.go`.
 
-## Step 2: Design & Write Unit Tests
-- Every self-modification MUST compile cleanly (`go vet ./...`) and pass all unit tests (`go test ./...`).
-- Whenever you add a new function or tool, include a corresponding `*_test.go` file in your proposal.
-- Never attempt to modify or delete files outside the repository; the macOS `sandbox-exec` Seatbelt kernel profile enforces `(deny file-write*)` outside the isolated worktree.
+## Step 2: Implement the New Tool & Unit Test
+1. Create a new file `internal/tools/<feature>_tool.go` implementing the `Tool` interface:
+   - `Name() string`
+   - `Description() string`
+   - `Parameters() json.RawMessage`
+   - `Execute(ctx context.Context, rawArgs string) (string, error)`
+2. Create a corresponding unit test `internal/tools/<feature>_tool_test.go` to verify your new tool works properly.
+3. Update `internal/tools/custom_tools.go` to register your new tool inside `RegisterCustomTools`:
+   ```go
+   func RegisterCustomTools(reg *Registry, deps CustomToolDeps) {
+       reg.Register(NewMyCustomTool(deps))
+   }
+   ```
 
 ## Step 3: Submit via `propose_self_evolution`
 Call `propose_self_evolution` with:
-- `title`: A short summary of the improvement.
-- `description`: Explanation of the changes and tests added.
-- `files`: Array of `{ "path": "relative/path.go", "content": "full Go file content" }`.
+- `title`: Concise summary of the new feature.
+- `description`: What the new feature does and how it was tested.
+- `files`: Array containing `internal/tools/<feature>_tool.go`, `internal/tools/<feature>_tool_test.go`, and `internal/tools/custom_tools.go`.
 
-## Step 4: Handle Sandbox Results & Request Human Approval
-- If `propose_self_evolution` returns a compiler or test error, carefully read the error output, fix the code, and call `propose_self_evolution` again.
-- Once `propose_self_evolution` succeeds, present the proposal ID and diff summary to the user so they can reply `/approve <proposal_id>` to merge and activate the update.
+## Step 4: Sandbox Verification & Human Approval
+- `propose_self_evolution` automatically runs `go vet ./...`, `go test ./...`, and `go build ./cmd/kawa` inside an isolated Git Worktree + macOS `sandbox-exec` Seatbelt sandbox.
+- If any compilation or test error occurs, read the error message, fix your code, and call `propose_self_evolution` again.
+- Once tests pass, tell the user the proposal ID (`evolve-...`) so they can reply `/approve <proposal_id>` to automatically merge, recompile, and hot-reload Kawa!

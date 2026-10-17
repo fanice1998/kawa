@@ -16,7 +16,9 @@ import (
 	"github.com/fanice1998/kawa/internal/evolution"
 	"github.com/fanice1998/kawa/internal/llm"
 	"github.com/fanice1998/kawa/internal/logger"
+	"github.com/fanice1998/kawa/internal/memory"
 	"github.com/fanice1998/kawa/internal/sandbox"
+	"github.com/fanice1998/kawa/internal/scheduler"
 	"github.com/fanice1998/kawa/internal/skills"
 	"github.com/fanice1998/kawa/internal/tools"
 )
@@ -62,7 +64,7 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize workspace FSJail")
 	}
 
-	// Source directory jail is strictly READ-ONLY during normal tool calls!
+	// Source directory jail is strictly READ-ONLY during normal tool calls
 	sourceReadOnlyJail, err := sandbox.NewFSJail(cfg.Agent.SourceDir, "", true)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize read-only source FSJail")
@@ -78,14 +80,32 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize Seatbelt sandbox runner")
 	}
 
-	// 3. Initialize Skills Manager
+	// 3. Initialize Two-Tier Memory + Hybrid RAG Engine
+	memEngine, err := memory.NewEngine(cfg.Sandbox.StateDir)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize RAG memory engine")
+	}
+
+	// 4. Initialize Autonomous Scheduler
+	sched, err := scheduler.NewScheduler(cfg.Sandbox.StateDir, nil)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize scheduler")
+	}
+
+	// 5. Initialize Skills Manager
 	skillsBackupDir := filepath.Join(cfg.Sandbox.StateDir, "backups", "skills")
 	skillMgr, err := skills.NewManager(cfg.Agent.SkillsDir, skillsBackupDir)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize skills manager")
 	}
 
-	// 4. Initialize Self-Evolution Engine (Git Worktree + Seatbelt + Human Approval)
+	// Determine target binary path for self-recompilation and hot-reload
+	binPath := filepath.Join(cfg.Agent.SourceDir, "bin", "kawa")
+	if exe, err := os.Executable(); err == nil && !filepath.HasPrefix(exe, os.TempDir()) {
+		binPath = exe
+	}
+
+	// 6. Initialize Self-Evolution Engine (Git Worktree + Seatbelt + Human Approval)
 	evolveEngine, err := evolution.NewEngine(
 		cfg.Agent.SourceDir,
 		cfg.Sandbox.StateDir,
@@ -94,9 +114,9 @@ func main() {
 			log.Info().
 				Str("proposal_id", p.ID).
 				Str("title", p.Title).
-				Msg("Self-evolution applied; rebuilding Kawa binary in sandbox")
+				Str("binary", binPath).
+				Msg("Self-evolution approved; rebuilding Kawa binary in sandbox")
 
-			binPath := filepath.Join(cfg.Agent.SourceDir, "bin", "kawa")
 			_ = os.MkdirAll(filepath.Dir(binPath), 0o755)
 			if _, statErr := os.Stat(binPath); statErr == nil {
 				_ = os.Rename(binPath, binPath+".bak")
@@ -116,7 +136,7 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize self-evolution engine")
 	}
 
-	// 5. Register Safe Tools (NO arbitrary bash/rm tools exist)
+	// 7. Register Core Safe Tools + Custom Self-Evolved Tools
 	toolRegistry := tools.NewRegistry()
 	toolRegistry.Register(tools.NewReadFileTool(workspaceJail, sourceReadOnlyJail))
 	toolRegistry.Register(tools.NewWriteFileTool(workspaceJail))
@@ -127,12 +147,28 @@ func main() {
 	toolRegistry.Register(tools.NewListSkillsTool(skillMgr))
 	toolRegistry.Register(tools.NewReadSkillTool(skillMgr))
 	toolRegistry.Register(tools.NewSaveSkillTool(skillMgr))
+	toolRegistry.Register(tools.NewMemorySaveTool(memEngine))
+	toolRegistry.Register(tools.NewMemorySearchTool(memEngine))
+	toolRegistry.Register(tools.NewMemoryDeleteTool(memEngine))
+	toolRegistry.Register(tools.NewScheduleCreateTool(sched))
+	toolRegistry.Register(tools.NewScheduleListTool(sched))
+	toolRegistry.Register(tools.NewScheduleDeleteTool(sched))
 	toolRegistry.Register(evolution.NewProposeEvolutionTool(evolveEngine, nil))
 
-	// 6. Initialize Multi-Provider LLM Registry
+	// Register any self-developed tools from internal/tools/custom_tools.go
+	tools.RegisterCustomTools(toolRegistry, tools.CustomToolDeps{
+		Config:         cfg,
+		WorkspaceJail:  workspaceJail,
+		SourceJail:     sourceReadOnlyJail,
+		SeatbeltRunner: seatbeltRunner,
+		Memory:         memEngine,
+		Scheduler:      sched,
+	})
+
+	// 8. Initialize Multi-Provider LLM Registry
 	llmRegistry := llm.NewRegistry(cfg.LLM, cfg.Agent.DefaultProvider)
 
-	// 7. Initialize Extensible Communication Channels
+	// 9. Initialize Extensible Communication Channels
 	router := channel.NewRouter()
 	activeChannels := 0
 	if cfg.Channels.Telegram.Enabled {
@@ -147,11 +183,20 @@ func main() {
 		router.Register(channel.NewCLIChannel())
 	}
 
-	// 8. Start Agent Loop with Graceful Shutdown
+	// Hot-reload callback uses syscall.Exec to replace the running process with the newly compiled binary
+	hotReloadFn := func() {
+		if _, err := os.Stat(binPath); err != nil {
+			return
+		}
+		log.Info().Str("binary", binPath).Msg("Hot-reloading Kawa process via syscall.Exec")
+		_ = syscall.Exec(binPath, os.Args, os.Environ())
+	}
+
+	// 10. Start Agent Loop with Graceful Shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	kawaAgent := agent.New(cfg, llmRegistry, toolRegistry, skillMgr, evolveEngine, router)
+	kawaAgent := agent.New(cfg, llmRegistry, toolRegistry, skillMgr, memEngine, sched, evolveEngine, router, hotReloadFn)
 	if err := kawaAgent.Run(ctx); err != nil {
 		log.Fatal().Err(err).Msg("Kawa Agent terminated with error")
 	}
