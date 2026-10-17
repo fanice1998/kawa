@@ -59,9 +59,38 @@ type tgUpdatesResp struct {
 	} `json:"result"`
 }
 
+// BotCommand represents a command item in Telegram's native `/` menu.
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// DefaultBotCommands lists all commands automatically synced to Telegram via setMyCommands.
+func DefaultBotCommands() []BotCommand {
+	return []BotCommand{
+		{Command: "task", Description: "規劃新功能並產生 TASK.md 任務書"},
+		{Command: "run_task", Description: "照著 TASK.md 自動分階段開發並測試"},
+		{Command: "status", Description: "查看模型、沙盒、記憶庫與排程狀態"},
+		{Command: "pending", Description: "查看待審核的自我進化 Diff 提案"},
+		{Command: "approve", Description: "核准並套用自我修改提案 (/approve <id>)"},
+		{Command: "reject", Description: "拒絕並清除自我修改提案 (/reject <id>)"},
+		{Command: "memory", Description: "查看核心記憶 (MEMORY.md) 與 RAG 記憶"},
+		{Command: "jobs", Description: "查看執行中的定時排程任務"},
+		{Command: "provider", Description: "切換 AI 模型 (/provider <name>)"},
+		{Command: "sync_commands", Description: "手動將指令清單同步更新至 Telegram 選單"},
+		{Command: "reset", Description: "清除當前短期對話記憶"},
+		{Command: "help", Description: "顯示所有指令與開發流程說明"},
+	}
+}
+
 func (t *TelegramChannel) Start(ctx context.Context, inbound chan<- InboundMessage) error {
 	if t.token == "" {
 		return fmt.Errorf("telegram bot_token is empty")
+	}
+	if err := t.SyncCommands(ctx, DefaultBotCommands()); err != nil {
+		log.Warn().Err(err).Msg("Failed to auto-sync Telegram bot commands on startup")
+	} else {
+		log.Info().Int("commands", len(DefaultBotCommands())).Msg("Successfully synced Telegram bot commands menu (setMyCommands)")
 	}
 	var offset int64
 
@@ -159,6 +188,34 @@ func (t *TelegramChannel) sendTypingAction(ctx context.Context, chatID string) {
 	if err == nil {
 		_ = resp.Body.Close()
 	}
+}
+
+// SyncCommands calls Telegram Bot API `setMyCommands` so the `/` command menu is automatically updated in Telegram clients.
+func (t *TelegramChannel) SyncCommands(ctx context.Context, commands []BotCommand) error {
+	payload, err := json.Marshal(map[string]any{
+		"commands": commands,
+	})
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", t.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram setMyCommands: %w", err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("telegram setMyCommands HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 func (t *TelegramChannel) Send(ctx context.Context, recipient string, text string) error {

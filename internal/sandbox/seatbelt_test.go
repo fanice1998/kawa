@@ -14,6 +14,9 @@ func TestSeatbeltBlocksOutsideDeletionAndModification(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS sandbox-exec test only runs on darwin")
 	}
+	if os.Getenv("KAWA_IN_SEATBELT") == "1" {
+		t.Skip("already running inside an outer macOS Seatbelt sandbox; nested sandbox_apply is disallowed by XNU")
+	}
 
 	baseDir := t.TempDir()
 	// Create a precious file outside the allowed worktree to simulate user's host files

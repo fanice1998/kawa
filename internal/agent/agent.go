@@ -146,6 +146,17 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 		Content: trimmed,
 	})
 
+	// Autonomous TASK.md Pipeline Trigger:
+	// When the user confirms a discussed feature (e.g., "就這樣做！", "開始實作", "做成 TASK.md"),
+	// automatically generate TASK.md and run Stage 1 -> Stage 2 -> Stage 3 to completion!
+	if isTaskExecutionTrigger(trimmed, history) {
+		log.Info().
+			Str("channel", channelName).
+			Str("trigger", truncateLog(trimmed, 80)).
+			Msg("Triggered autonomous TASK.md multi-stage feature development pipeline")
+		return a.RunTaskPipeline(ctx, channelName, senderID, trimmed)
+	}
+
 	provider, err := a.llmRegistry.Active()
 	if err != nil {
 		return "", err
@@ -338,11 +349,14 @@ func shouldAutoSaveCoreMemory(userText string) bool {
 	return false
 }
 
-// isIncompleteToolAttempt detects when a model says "好的，我將會查詢..." or ends with dangling ```
+// isIncompleteToolAttempt detects when a model says "好的，我將會查詢..." or ends with an unclosed ``` fence
 // because Ollama's parser stripped or truncated the <tool_call> block.
 func isIncompleteToolAttempt(content string) bool {
 	trimmed := strings.TrimSpace(content)
-	if strings.HasSuffix(trimmed, "```") || strings.HasSuffix(trimmed, "```json") || strings.HasSuffix(trimmed, "```xml") || strings.Contains(trimmed, "<tool_call") {
+	if strings.HasSuffix(trimmed, "```json") || strings.HasSuffix(trimmed, "```xml") || strings.Contains(trimmed, "<tool_call") {
+		return true
+	}
+	if strings.HasSuffix(trimmed, "```") && strings.Count(trimmed, "```")%2 == 1 {
 		return true
 	}
 	// If it's a very short reply promising to search/check without any actual results
@@ -439,7 +453,9 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 	switch cmd {
 	case "/help":
 		return strings.Join([]string{
-			"🤖 Kawa AI Agent 管理指令：",
+			"🤖 **Kawa AI Agent 管理指令：**",
+			"• `/task <功能需求>` — 與 Kawa 確認新功能規格並產生 `TASK.md` 階段任務書",
+			"• `/run_task` — 照著 `TASK.md` 自動分階段執行程式碼開發與沙盒測試",
 			"• `/status` — 查看目前模型、沙盒、記憶庫、排程與待審核提案狀態",
 			"• `/provider <名稱>` — 切換 AI 模型 (`ollama`, `xai_grok`, `grok_oauth`, `claude`, `gemini`, `gemini_oauth`)",
 			"• `/memory` — 查看核心記憶 (`MEMORY.md`) 與最近 RAG 記憶項目",
@@ -447,8 +463,69 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 			"• `/pending` — 列出所有等待人工審核的自我修改提案與 Diff",
 			"• `/approve <proposal_id>` — 核准並套用自我修改提案（自動重編譯並熱重啟）",
 			"• `/reject <proposal_id>` — 拒絕並清理指定的自我修改提案",
+			"• `/sync_commands` — 將所有可用指令自動同步至 Telegram `/` 選單",
 			"• `/reset` — 清除當前短期對話視窗記憶（長期 RAG 記憶保留）",
+			"",
+			"💡 **如何請 Kawa 開發新功能？**",
+			"1️⃣ 直接跟 Kawa 討論你想要的功能（或輸入 `/task <需求>`）",
+			"2️⃣ 確認細節無誤後，直接說 **「就這樣做！」**、**「開始實作」** 或輸入 `/run_task`",
+			"3️⃣ Kawa 就會自動建立 `TASK.md`，並依序完成 Stage 1~3 開發與沙盒驗證！",
 		}, "\n"), true
+
+	case "/task":
+		sessionKey := channelName + ":" + senderID
+		extra := strings.TrimSpace(strings.TrimPrefix(cmdLine, fields[0]))
+		if extra == "" {
+			if spec, err := a.loadTaskSpec(); err == nil && spec != nil {
+				return fmt.Sprintf("📋 **目前的 `TASK.md` 任務書：**\n\n%s\n👉 若要立即照著 `TASK.md` 執行，請回覆 **「就這樣做」** 或輸入 `/run_task`！", renderTaskMarkdown(spec)), true
+			}
+		} else {
+			a.appendSessionMessage(sessionKey, llm.Message{
+				Role:    llm.RoleUser,
+				Content: extra,
+			})
+		}
+		spec, md, err := a.DraftTaskSpecFromConversation(ctx, sessionKey, extra)
+		if err != nil {
+			return fmt.Sprintf("❌ 建立 `TASK.md` 失敗: %v", err), true
+		}
+		a.recordAction(fmt.Sprintf("Drafted TASK.md (%s)", spec.Title))
+		reply := fmt.Sprintf(
+			"📝 **已根據目前討論整理出 `TASK.md` 任務規劃：**\n\n%s\n"+
+				"---\n"+
+				"請確認以上需求與修改檔案是否符合你的期望：\n"+
+				"• 若需補充或調整，請直接告訴我，或再次輸入 `/task <補充說明>`。\n"+
+				"• 若確認無誤，請直接回覆 **「就這樣做！」**、**「開始實作」** 或點選 `/run_task`，我就會自動照著 `TASK.md` 的三個階段把程式碼與測試寫完！",
+			md,
+		)
+		a.appendSessionMessage(sessionKey, llm.Message{
+			Role:    llm.RoleAssistant,
+			Content: reply,
+		})
+		return reply, true
+
+	case "/run_task":
+		extra := strings.TrimSpace(strings.TrimPrefix(cmdLine, fields[0]))
+		out, err := a.RunTaskPipeline(ctx, channelName, senderID, extra)
+		if err != nil {
+			return fmt.Sprintf("❌ 執行 `TASK.md` 開發流程失敗: %v", err), true
+		}
+		return out, true
+
+	case "/sync_commands":
+		if a.router == nil {
+			return "❌ Router 未初始化。", true
+		}
+		cmds := channel.DefaultBotCommands()
+		if err := a.router.SyncChannelCommands(ctx, channelName, cmds); err != nil {
+			return fmt.Sprintf("❌ 同步 Telegram 指令選單失敗: %v", err), true
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("✅ 已成功將 %d 個指令同步更新至 Telegram `/` 指令選單 (`setMyCommands`)：\n", len(cmds)))
+		for _, c := range cmds {
+			sb.WriteString(fmt.Sprintf("• `/%s` — %s\n", c.Command, c.Description))
+		}
+		return strings.TrimSpace(sb.String()), true
 
 	case "/status":
 		p, _ := a.llmRegistry.Active()
@@ -672,12 +749,12 @@ func (a *Agent) buildSystemPrompt(channelName, senderID, userQuery string, toolD
 		}
 	}
 
-	// 4. Self-Development Architecture Guide
-	sb.WriteString("\n## 4. 如何為自己開發新功能 (Self-Development Architecture)\n")
-	sb.WriteString("- 當使用者要求你為自己新增工具或開發新功能時：\n")
-	sb.WriteString("  1. 先呼叫 `read_file` (`scope: \"source\"`, `path: \"internal/tools/custom_tools.go\"`) 與 `internal/tools/tool.go` 了解介面。\n")
-	sb.WriteString("  2. 呼叫 `propose_self_evolution` 提交新檔案（例如 `internal/tools/<name>_tool.go`、`internal/tools/<name>_tool_test.go`）以及更新後的 `internal/tools/custom_tools.go`（在 `RegisterCustomTools` 中呼叫 `reg.Register(...)`）。\n")
-	sb.WriteString("  3. `propose_self_evolution` 會自動在隔離 Git Worktree 與 macOS `sandbox-exec` 沙盒中執行 `go vet`、`go test` 與 `go build`。通過後請把提案 ID 告訴使用者，使用者回覆 `/approve <id>` 後系統就會自動合併、重編譯並熱重啟！\n")
+	// 4. Self-Development & TASK.md Workflow Guide
+	sb.WriteString("\n## 4. 如何為自己開發新功能 (`TASK.md` 階段式自主開發流程)\n")
+	sb.WriteString("- 當使用者向你提出「想要開發某個新功能」或詢問「可以實作這個功能嗎」時：\n")
+	sb.WriteString("  1. **第一階段（需求確認）**：請先針對我們自己的 Kawa Golang 專案架構（例如 `internal/channel/telegram.go`、`internal/tools/custom_tools.go`、`internal/agent/agent.go`）向使用者簡短說明預計修改的檔案與實作方式，並詢問使用者是否確認。\n")
+	sb.WriteString("  2. **引導進入 `TASK.md` 自動執行**：在回覆結尾請明確提醒使用者：\n")
+	sb.WriteString("     『👉 若確認規格無誤，請直接回覆 **「就這樣做！」**、**「開始實作」** 或輸入 `/run_task`，我就會自動建立 `TASK.md` 任務書並照著階段完成開發與沙盒測試！』\n")
 
 	if skillsList, err := a.skillMgr.ListSkills(); err == nil && len(skillsList) > 0 {
 		sb.WriteString("\n## 5. 已安裝的 Skills (可用 `read_skill` 讀取詳細步驟，或用 `save_skill` 新增技能)\n")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,8 +28,8 @@ type OllamaProvider struct {
 
 func NewOllamaProvider(cfg config.OllamaConfig) *OllamaProvider {
 	timeout := time.Duration(cfg.TimeoutSec) * time.Second
-	if timeout <= 0 {
-		timeout = 120 * time.Second
+	if timeout < 600*time.Second {
+		timeout = 600 * time.Second
 	}
 	return &OllamaProvider{
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
@@ -74,6 +75,7 @@ type ollamaToolCall struct {
 
 type ollamaChatResp struct {
 	Message ollamaMessage `json:"message"`
+	Done    bool          `json:"done"`
 }
 
 func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
@@ -117,9 +119,10 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		Model:    p.model,
 		Messages: msgs,
 		Tools:    tools,
-		Stream:   false,
+		Stream:   true,
 		Options: map[string]any{
 			"num_ctx":     16384,
+			"num_predict": 4096,
 			"temperature": 0.2,
 		},
 	})
@@ -139,22 +142,35 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 		return nil, fmt.Errorf("ollama HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	var oResp ollamaChatResp
-	if err := json.Unmarshal(body, &oResp); err != nil {
-		return nil, fmt.Errorf("decode ollama response: %w", err)
+	var contentBuilder strings.Builder
+	var rawToolCalls []ollamaToolCall
+
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 8*1024*1024))
+	for {
+		var chunk ollamaChatResp
+		if err := dec.Decode(&chunk); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("decode ollama response chunk: %w", err)
+		}
+		contentBuilder.WriteString(chunk.Message.Content)
+		if len(chunk.Message.ToolCalls) > 0 {
+			rawToolCalls = append(rawToolCalls, chunk.Message.ToolCalls...)
+		}
 	}
 
 	out := &ChatResponse{
-		Content:  oResp.Message.Content,
+		Content:  contentBuilder.String(),
 		Provider: p.Name(),
 		Model:    p.model,
 	}
-	for i, tc := range oResp.Message.ToolCalls {
+	for i, tc := range rawToolCalls {
 		out.ToolCalls = append(out.ToolCalls, ToolCall{
 			ID:        fmt.Sprintf("ollama-call-%d", i+1),
 			Name:      tc.Function.Name,

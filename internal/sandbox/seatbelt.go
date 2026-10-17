@@ -131,7 +131,8 @@ func (r *SeatbeltRunner) runWhitelisted(ctx context.Context, workDir string, bin
 	defer cancel()
 
 	var cmd *exec.Cmd
-	if r.useSeatbelt {
+	alreadyInSeatbelt := os.Getenv("KAWA_IN_SEATBELT") == "1"
+	if r.useSeatbelt && !alreadyInSeatbelt {
 		profile, err := r.BuildSeatbeltProfile(absWork)
 		if err != nil {
 			return nil, err
@@ -148,9 +149,9 @@ func (r *SeatbeltRunner) runWhitelisted(ctx context.Context, workDir string, bin
 
 	// Override TMPDIR and GOCACHE so Go writes temporary artifacts strictly inside sandboxTmpDir
 	env := os.Environ()
-	filteredEnv := make([]string, 0, len(env)+3)
+	filteredEnv := make([]string, 0, len(env)+4)
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "TMPDIR=") || strings.HasPrefix(kv, "GOCACHE=") || strings.HasPrefix(kv, "GOTMPDIR=") {
+		if strings.HasPrefix(kv, "TMPDIR=") || strings.HasPrefix(kv, "GOCACHE=") || strings.HasPrefix(kv, "GOTMPDIR=") || strings.HasPrefix(kv, "KAWA_IN_SEATBELT=") {
 			continue
 		}
 		filteredEnv = append(filteredEnv, kv)
@@ -160,6 +161,9 @@ func (r *SeatbeltRunner) runWhitelisted(ctx context.Context, workDir string, bin
 		"GOTMPDIR="+goTmpDir,
 		"GOCACHE="+goCacheDir,
 	)
+	if r.useSeatbelt || alreadyInSeatbelt {
+		filteredEnv = append(filteredEnv, "KAWA_IN_SEATBELT=1")
+	}
 	cmd.Env = filteredEnv
 
 	var stdout, stderr bytes.Buffer

@@ -27,6 +27,11 @@ type TypingChannel interface {
 	StartTyping(ctx context.Context, recipient string) func()
 }
 
+// CommandSyncChannel can be implemented by channels (like Telegram) that support syncing a slash command menu.
+type CommandSyncChannel interface {
+	SyncCommands(ctx context.Context, commands []BotCommand) error
+}
+
 // Router manages multiple active communication channels and routes messages between them and the Agent.
 type Router struct {
 	mu       sync.RWMutex
@@ -89,3 +94,18 @@ func (r *Router) StartTyping(ctx context.Context, channelName, recipient string)
 	}
 	return func() {}
 }
+
+// SyncChannelCommands syncs the bot command list on channels that implement CommandSyncChannel.
+func (r *Router) SyncChannelCommands(ctx context.Context, channelName string, commands []BotCommand) error {
+	r.mu.RLock()
+	ch, ok := r.channels[channelName]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("channel %q not registered", channelName)
+	}
+	if sc, ok := ch.(CommandSyncChannel); ok {
+		return sc.SyncCommands(ctx, commands)
+	}
+	return fmt.Errorf("channel %q does not support command menu sync", channelName)
+}
+
