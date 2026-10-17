@@ -1,0 +1,122 @@
+# ==============================================================================
+# Kawa AI Agent Configuration Example (config.toml.example)
+# Copy this file to `config.toml` and fill in your credentials.
+# ==============================================================================
+
+[agent]
+name = "Kawa"
+# Directory where the agent can freely read/write general workspace files (jailed via os.Root)
+workspace_dir = "./workspace"
+# Directory of Kawa's own source code (read-only during normal chat; isolated via Git Worktree during evolution)
+source_dir = "."
+# Directory where reusable agent skills (SKILL.md) are stored
+skills_dir = "./skills"
+# Maximum tool-calling iterations per user request
+max_iterations = 15
+# Default active LLM provider: "ollama", "xai_grok", "grok_oauth", "claude", "gemini", "gemini_oauth"
+default_provider = "ollama"
+# Optional custom system prompt addition
+system_prompt = "You are Kawa, a safe, self-evolving Golang AI agent."
+
+[log]
+# Log level: "debug", "info", "warn", "error"
+level = "info"
+# Directory where daily log files ("YYYY-MM-DD.log") are stored
+dir = "./logs"
+
+[sandbox]
+# Enforce Go 1.24+ os.Root file system jail and backup-before-overwrite
+enabled = true
+# Enforce macOS kernel-level sandbox-exec (Seatbelt) during self-test and self-evolution
+use_macos_seatbelt = true
+# Timeout (in seconds) for sandboxed `go vet` / `go test` / `go build`
+test_timeout_sec = 120
+# Require explicit human approval (/approve <id>) via Telegram/iMessage before merging self-modifications
+require_human_approval = true
+# Internal state directory for worktrees, backups, and sandbox temp files
+state_dir = "./.kawa"
+
+# ==============================================================================
+# LLM Providers Configuration
+# ==============================================================================
+
+[llm.ollama]
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:14b"
+timeout_sec = 120
+
+[llm.xai_grok]
+base_url = "https://api.x.ai/v1"
+api_key = "xai-YOUR_GROK_API_KEY"
+model = "grok-2-latest"
+timeout_sec = 120
+
+[llm.grok_oauth]
+base_url = "https://api.x.ai/v1"
+model = "grok-2-latest"
+access_token = "YOUR_GROK_OAUTH_ACCESS_TOKEN"
+refresh_token = "YOUR_GROK_OAUTH_REFRESH_TOKEN"
+token_url = "https://api.x.ai/v1/oauth2/token"
+client_id = "YOUR_GROK_CLIENT_ID"
+client_secret = ""
+# RFC3339 expiration timestamp (optional, auto-refreshed when expired or on 401)
+expires_at = "2026-12-31T23:59:59Z"
+timeout_sec = 120
+
+[llm.claude]
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-YOUR_CLAUDE_API_KEY"
+model = "claude-3-7-sonnet-latest"
+max_tokens = 8192
+anthropic_version = "2023-06-01"
+timeout_sec = 120
+
+[llm.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key = "AIzaSy-YOUR_GEMINI_API_KEY"
+model = "gemini-2.5-pro"
+timeout_sec = 120
+
+[llm.gemini_oauth]
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+model = "gemini-2.5-pro"
+access_token = "ya29.YOUR_GOOGLE_OAUTH_ACCESS_TOKEN"
+refresh_token = "1//YOUR_GOOGLE_OAUTH_REFRESH_TOKEN"
+token_url = "https://oauth2.googleapis.com/token"
+client_id = "YOUR_GOOGLE_CLOUD_CLIENT_ID.apps.googleusercontent.com"
+client_secret = "YOUR_GOOGLE_CLOUD_CLIENT_SECRET"
+project_id = "YOUR_GCP_PROJECT_ID"
+expires_at = "2026-12-31T23:59:59Z"
+timeout_sec = 120
+
+# ==============================================================================
+# Communication Channels Configuration
+# ==============================================================================
+
+[channels.telegram]
+enabled = false
+bot_token = "123456789:ABCDEF_YOUR_TELEGRAM_BOT_TOKEN"
+# Only Telegram User IDs in this list can interact with Kawa or approve evolutions
+allowed_user_ids = [123456789]
+poll_timeout_sec = 30
+
+[channels.imessage]
+enabled = false
+# Path to macOS Messages SQLite database (opened strictly in read-only mode)
+chat_db_path = "~/Library/Messages/chat.db"
+# Poll interval in milliseconds for checking new incoming iMessages
+poll_interval_ms = 2000
+# Only iMessage handles (phone numbers like "+886912345678" or Apple ID emails) in this list are allowed
+allowed_handles = ["+886900000000", "your_apple_id@icloud.com"]
+
+# ==============================================================================
+# Tools Configuration
+# ==============================================================================
+
+[tools.web]
+# Search provider: "duckduckgo" (free, no key needed) or "brave"
+search_provider = "duckduckgo"
+brave_api_key = ""
+user_agent = "KawaAgent/1.0 (+https://github.com/fanice1998/kawa)"
+timeout_sec = 20
+max_fetch_bytes = 204800

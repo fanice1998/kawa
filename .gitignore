@@ -25,8 +25,16 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
+# env and local config files with secrets
 .env
+config.toml
+
+# Kawa runtime state, sandbox worktrees, backups, logs, and workspace
+/kawa
+.kawa/
+logs/
+workspace/
+bin/
 
 # Editor/IDE
 # .idea/
