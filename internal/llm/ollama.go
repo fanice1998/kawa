@@ -45,6 +45,7 @@ type ollamaChatReq struct {
 	Messages []ollamaMessage `json:"messages"`
 	Tools    []ollamaTool    `json:"tools,omitempty"`
 	Stream   bool            `json:"stream"`
+	Options  map[string]any  `json:"options,omitempty"`
 }
 
 type ollamaMessage struct {
@@ -117,6 +118,10 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		Messages: msgs,
 		Tools:    tools,
 		Stream:   false,
+		Options: map[string]any{
+			"num_ctx":     16384,
+			"temperature": 0.2,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal ollama request: %w", err)

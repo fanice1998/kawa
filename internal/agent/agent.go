@@ -193,22 +193,51 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 			return "", fmt.Errorf("LLM (%s) error: %w", provider.Name(), err)
 		}
 
-		// Auto-Correction Guard: If the model lazily tells the user "you can call `list_dir`"
-		// instead of calling the tool itself, intercept before replying and force autonomous execution!
+		log.Info().
+			Str("provider", provider.Name()).
+			Int("iteration", iter).
+			Int("tool_calls", len(resp.ToolCalls)).
+			Str("content_preview", truncateLog(resp.Content, 120)).
+			Msg("LLM response received")
+
+		// Auto-Correction Guard:
+		// 1) Model lazily tells the user "你可以使用 list_dir" instead of calling it itself, OR
+		// 2) Model outputs a truncated/promised tool call like "好的，我將會查詢...\n```" without an actual ToolCall!
 		if len(resp.ToolCalls) == 0 && len(toolDefs) > 0 && !nudgedForLazyTool {
 			if mentionedTool := mentionsToolWithoutCalling(resp.Content, toolDefs); mentionedTool != "" {
 				nudgedForLazyTool = true
 				log.Warn().
 					Str("mentioned_tool", mentionedTool).
-					Msg("Intercepted lazy tool mention; forcing autonomous <tool_call> execution")
+					Msg("Intercepted lazy tool mention; forcing autonomous tool execution")
 
 				history = a.appendSessionMessage(sessionKey, llm.Message{
 					Role:    llm.RoleAssistant,
 					Content: resp.Content,
 				})
 				nudge := fmt.Sprintf(
-					"[System Autonomous Correction] 你剛剛在文字中提到了工具 `%s`，但沒有實際呼叫它！請注意：使用者無法自己執行工具，你必須現在立刻自己輸出 `<tool_call>` 來執行 `%s` 取得結果，禁止叫使用者自己去呼叫！格式範例：\n<tool_call>\n{\"name\": %q, \"arguments\": {}}\n</tool_call>",
-					mentionedTool, mentionedTool, mentionedTool,
+					"[System Autonomous Correction] 你剛剛提到了工具 `%s` 但沒有實際呼叫它！請不要使用 ``` 區塊，現在立刻直接輸出純 JSON 執行工具：\n{\"name\": %q, \"arguments\": {}}",
+					mentionedTool, mentionedTool,
+				)
+				history = a.appendSessionMessage(sessionKey, llm.Message{
+					Role:    llm.RoleUser,
+					Content: nudge,
+				})
+				continue
+			}
+
+			if isIncompleteToolAttempt(resp.Content) || isFalseCapabilityRefusal(resp.Content) {
+				nudgedForLazyTool = true
+				log.Warn().
+					Str("content", truncateLog(resp.Content, 100)).
+					Msg("Intercepted incomplete or false-refusal response; forcing clean JSON tool call")
+
+				history = a.appendSessionMessage(sessionKey, llm.Message{
+					Role:    llm.RoleAssistant,
+					Content: resp.Content,
+				})
+				nudge := fmt.Sprintf(
+					"[System Autonomous Correction] 注意：你擁有完整的上網與檔案工具（包含 `web_search`、`web_fetch`、`list_dir`、`read_file` 等）！禁止回答「無法執行網路查詢」或只說「我將會查詢」。請針對使用者的問題 (%q)，現在立刻只輸出一行純 JSON 呼叫對應工具，例如：\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"grok ai tools\"}}",
+					trimmed,
 				)
 				history = a.appendSessionMessage(sessionKey, llm.Message{
 					Role:    llm.RoleUser,
@@ -299,6 +328,45 @@ func shouldAutoSaveCoreMemory(userText string) bool {
 	}
 	for _, kw := range []string{"記住", "我是 ", "我是", "我的名字是", "我叫", "我喜歡", "my name is"} {
 		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// isIncompleteToolAttempt detects when a model says "好的，我將會查詢..." or ends with dangling ```
+// because Ollama's parser stripped or truncated the <tool_call> block.
+func isIncompleteToolAttempt(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if strings.HasSuffix(trimmed, "```") || strings.HasSuffix(trimmed, "```json") || strings.HasSuffix(trimmed, "```xml") || strings.Contains(trimmed, "<tool_call") {
+		return true
+	}
+	// If it's a very short reply promising to search/check without any actual results
+	if len([]rune(trimmed)) < 60 {
+		promisePhrases := []string{
+			"我將會查詢", "我將查詢", "我會查詢", "我來查詢", "正在查詢",
+			"我將會搜尋", "我來搜尋", "正在搜尋", "讓我查詢", "讓我幫你查",
+			"我來查看", "我將查看", "正在為您查詢",
+		}
+		for _, p := range promisePhrases {
+			if strings.Contains(trimmed, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isFalseCapabilityRefusal detects when a local model mistakenly claims it cannot search the web or read files.
+func isFalseCapabilityRefusal(content string) bool {
+	lower := strings.ToLower(content)
+	refusals := []string{
+		"無法執行網路查詢", "無法上網", "沒有網路查詢", "無法搜尋網路",
+		"無法訪問網路", "無法連線到網路", "無法查詢即時", "我沒有上網",
+		"cannot browse the web", "cannot search the internet", "don't have internet access",
+	}
+	for _, r := range refusals {
+		if strings.Contains(lower, r) {
 			return true
 		}
 	}
@@ -527,9 +595,20 @@ func (a *Agent) buildSystemPrompt(channelName, senderID, userQuery string, toolD
 	sb.WriteString("  - 當使用者問「工作區 (workspace) 有哪些檔案」時，請呼叫 `list_dir` 並設定 `{\"scope\": \"workspace\", \"path\": \".\"}`。\n")
 
 	if len(toolDefs) > 0 {
-		sb.WriteString("- **Hermes `<tool_call>` 調用格式**：當你需要使用工具時，請直接發起 Function Call 或輸出：\n")
-		sb.WriteString("```xml\n<tool_call>\n{\"name\": \"工具名稱\", \"arguments\": {\"參數\": \"值\"}}\n</tool_call>\n```\n")
-		sb.WriteString("  拿到 `<tool_response>` 後，請用繁體中文自然地向使用者說明結果。\n")
+		sb.WriteString("- **你擁有的內建工具清單 (`<available_tools>`)**：\n")
+		sb.WriteString("  * `web_search`: 上網搜尋最新資訊、文件或問題（參數: `{\"query\": \"搜尋關鍵字\"}`）\n")
+		sb.WriteString("  * `web_fetch`: 抓取指定網址內容（參數: `{\"url\": \"https://...\"}`）\n")
+		sb.WriteString("  * `list_dir`: 列出目錄檔案（參數: `{\"scope\": \"source\" 或 \"workspace\", \"path\": \".\"}`）\n")
+		sb.WriteString("  * `read_file`: 讀取檔案內容（參數: `{\"scope\": \"source\" 或 \"workspace\", \"path\": \"相對路徑\"}`）\n")
+		sb.WriteString("  * `write_file`: 寫入檔案至 workspace（參數: `{\"path\": \"相對路徑\", \"content\": \"內容\"}`）\n")
+		sb.WriteString("  * `run_self_test`: 在 macOS 沙盒執行自我測試（參數: `{\"package\": \"./...\"}`）\n")
+		sb.WriteString("  * `propose_self_evolution`: 為自己修改原始碼或新增功能（參數: `{\"title\": \"...\", \"description\": \"...\", \"files\": [...]}`）\n")
+		sb.WriteString("  * `memory_save` / `memory_search` / `memory_delete`: 儲存、RAG 搜尋或刪除長期記憶\n")
+		sb.WriteString("  * `schedule_create` / `schedule_list` / `schedule_delete`: 建立、列出或刪除定時排程任務\n")
+		sb.WriteString("  * `list_skills` / `read_skill` / `save_skill`: 管理可重用的技能指南 (Skills)\n")
+		sb.WriteString("- **工具調用格式（極重要）**：當你需要使用工具時，**絕對不要在工具呼叫前後加上 ``` 程式碼區塊符號**，也不要只說「我將會查詢」，請直接單獨輸出一行純 JSON：\n")
+		sb.WriteString("  {\"name\": \"web_search\", \"arguments\": {\"query\": \"關鍵字\"}}\n")
+		sb.WriteString("  拿到 `<tool_response>` 後，請根據結果直接用繁體中文回答使用者。\n")
 	}
 
 	// 2. Live Self-Awareness Snapshot (<agent_state>)

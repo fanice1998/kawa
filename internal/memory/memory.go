@@ -150,6 +150,13 @@ func (e *Engine) RecordEpisode(channelAndSender, userText, assistantText string)
 	if len([]rune(u)) < 4 || strings.HasPrefix(u, "/") {
 		return
 	}
+	// Never pollute long-term RAG memory with error messages or capability refusals
+	badReplies := []string{"無法執行網路查詢", "無法上網", "執行發生錯誤", "(模型未回傳文字內容)", "已達到單次對話最大工具"}
+	for _, bad := range badReplies {
+		if strings.Contains(a, bad) {
+			return
+		}
+	}
 	if len([]rune(a)) > 300 {
 		r := []rune(a)
 		a = string(r[:300]) + "..."
