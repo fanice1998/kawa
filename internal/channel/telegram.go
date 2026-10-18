@@ -47,14 +47,19 @@ type tgUpdatesResp struct {
 	Result []struct {
 		UpdateID int64 `json:"update_id"`
 		Message  *struct {
-			Text string `json:"text"`
-			From struct {
+			MessageID int    `json:"message_id"`
+			Text      string `json:"text"`
+			From      struct {
 				ID       int64  `json:"id"`
 				Username string `json:"username"`
 			} `json:"from"`
 			Chat struct {
 				ID int64 `json:"id"`
 			} `json:"chat"`
+			ReplyToMessage *struct {
+				MessageID int    `json:"message_id"`
+				Text      string `json:"text"`
+			} `json:"reply_to_message"`
 		} `json:"message"`
 	} `json:"result"`
 }
@@ -148,10 +153,17 @@ func (t *TelegramChannel) Start(ctx context.Context, inbound chan<- InboundMessa
 				continue
 			}
 
+			replyMsgID := 0
+			if u.Message.ReplyToMessage != nil {
+				replyMsgID = u.Message.ReplyToMessage.MessageID
+			}
+
 			inbound <- InboundMessage{
-				ChannelName: t.Name(),
-				SenderID:    strconv.FormatInt(chatID, 10),
-				Text:        strings.TrimSpace(u.Message.Text),
+				ChannelName:      t.Name(),
+				SenderID:         strconv.FormatInt(chatID, 10),
+				Text:             strings.TrimSpace(u.Message.Text),
+				MessageID:        u.Message.MessageID,
+				ReplyToMessageID: replyMsgID,
 			}
 		}
 	}

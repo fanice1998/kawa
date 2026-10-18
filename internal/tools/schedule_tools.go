@@ -14,6 +14,8 @@ type contextKey string
 const (
 	ctxKeyChannel   contextKey = "channel"
 	ctxKeyRecipient contextKey = "recipient"
+	ctxKeyMsgID     contextKey = "message_id"
+	ctxKeyReplyID   contextKey = "reply_to_message_id"
 )
 
 // WithDeliveryTarget attaches the active channel & sender ID to ctx so scheduled jobs know where to deliver results.
@@ -28,6 +30,20 @@ func DeliveryTargetFromContext(ctx context.Context) (string, string) {
 	ch, _ := ctx.Value(ctxKeyChannel).(string)
 	rec, _ := ctx.Value(ctxKeyRecipient).(string)
 	return ch, rec
+}
+
+// WithMessageMeta attaches the current message_id and reply_to_message_id to ctx so channel tools can act on them.
+func WithMessageMeta(ctx context.Context, messageID, replyToMessageID int) context.Context {
+	ctx = context.WithValue(ctx, ctxKeyMsgID, messageID)
+	ctx = context.WithValue(ctx, ctxKeyReplyID, replyToMessageID)
+	return ctx
+}
+
+// MessageMetaFromContext returns (messageID, replyToMessageID) from ctx.
+func MessageMetaFromContext(ctx context.Context) (int, int) {
+	msgID, _ := ctx.Value(ctxKeyMsgID).(int)
+	replyID, _ := ctx.Value(ctxKeyReplyID).(int)
+	return msgID, replyID
 }
 
 // ScheduleCreateTool creates a recurring or one-shot scheduled task.

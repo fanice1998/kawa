@@ -19,11 +19,26 @@ func TestIsTaskExecutionTrigger(t *testing.T) {
 	if !isTaskExecutionTrigger("幫我做成 TASK.md 並開始實作", nil) {
 		t.Fatalf("expected explicit TASK.md trigger to return true")
 	}
+	if !isTaskExecutionTrigger("繼續實作 刪除 Telegram 訊息", nil) {
+		t.Fatalf("expected '繼續實作 刪除 Telegram 訊息' to trigger task pipeline")
+	}
 	if !isTaskExecutionTrigger("好，開始做", hist) {
 		t.Fatalf("expected short confirmation with feature history to return true")
 	}
 	if isTaskExecutionTrigger("今天天氣如何？", hist) {
 		t.Fatalf("did not expect unrelated question to trigger task pipeline")
+	}
+}
+
+func TestFastImmediateCommandAndQueueStatus(t *testing.T) {
+	if !isFastImmediateCommand("/queue@fanice_kawa_bot") {
+		t.Fatalf("expected /queue@fanice_kawa_bot to be recognized as fast immediate command")
+	}
+	if !isFastImmediateCommand("/cancel") {
+		t.Fatalf("expected /cancel to be recognized as fast immediate command")
+	}
+	if isFastImmediateCommand("/run_task@fanice_kawa_bot") {
+		t.Fatalf("did not expect /run_task to bypass the heavy task queue")
 	}
 }
 

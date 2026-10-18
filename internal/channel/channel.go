@@ -10,9 +10,11 @@ import (
 
 // InboundMessage represents a normalized message received from any communication channel.
 type InboundMessage struct {
-	ChannelName string
-	SenderID    string
-	Text        string
+	ChannelName      string
+	SenderID         string
+	Text             string
+	MessageID        int
+	ReplyToMessageID int
 }
 
 // Channel is the extensible interface for all communication integrations (Telegram, iMessage, Discord, Slack, etc.).
@@ -30,6 +32,11 @@ type TypingChannel interface {
 // CommandSyncChannel can be implemented by channels (like Telegram) that support syncing a slash command menu.
 type CommandSyncChannel interface {
 	SyncCommands(ctx context.Context, commands []BotCommand) error
+}
+
+// MessageDeletableChannel can be implemented by channels (like Telegram) that support deleting messages by ID.
+type MessageDeletableChannel interface {
+	DeleteMessage(ctx context.Context, chatID string, messageID int) error
 }
 
 // Router manages multiple active communication channels and routes messages between them and the Agent.
@@ -107,5 +114,19 @@ func (r *Router) SyncChannelCommands(ctx context.Context, channelName string, co
 		return sc.SyncCommands(ctx, commands)
 	}
 	return fmt.Errorf("channel %q does not support command menu sync", channelName)
+}
+
+// DeleteMessage deletes a message by ID on channels that implement MessageDeletableChannel.
+func (r *Router) DeleteMessage(ctx context.Context, channelName, chatID string, messageID int) error {
+	r.mu.RLock()
+	ch, ok := r.channels[channelName]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("channel %q not registered", channelName)
+	}
+	if dc, ok := ch.(MessageDeletableChannel); ok {
+		return dc.DeleteMessage(ctx, chatID, messageID)
+	}
+	return fmt.Errorf("channel %q does not support message deletion", channelName)
 }
 

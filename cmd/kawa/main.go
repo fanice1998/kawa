@@ -105,6 +105,23 @@ func main() {
 		binPath = exe
 	}
 
+	// Helper to atomically compile a fresh Mach-O inode on macOS arm64 (avoids AMFI vnode cache SIGKILL 137)
+	atomicBuildBinary := func(targetPath string) error {
+		_ = os.MkdirAll(filepath.Dir(targetPath), 0o755)
+		tmpPath := targetPath + ".new"
+		_ = os.Remove(tmpPath)
+		res, buildErr := seatbeltRunner.RunGo(context.Background(), cfg.Agent.SourceDir, "build", "-o", tmpPath, "./cmd/kawa")
+		if buildErr != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("%w: %s", buildErr, res.Stderr)
+		}
+		_ = os.Remove(targetPath + ".bak")
+		if _, statErr := os.Stat(targetPath); statErr == nil {
+			_ = os.Rename(targetPath, targetPath+".bak")
+		}
+		return os.Rename(tmpPath, targetPath)
+	}
+
 	// 6. Initialize Self-Evolution Engine (Git Worktree + Seatbelt + Human Approval)
 	evolveEngine, err := evolution.NewEngine(
 		cfg.Agent.SourceDir,
@@ -117,16 +134,8 @@ func main() {
 				Str("binary", binPath).
 				Msg("Self-evolution approved; rebuilding Kawa binary in sandbox")
 
-			_ = os.MkdirAll(filepath.Dir(binPath), 0o755)
-			if _, statErr := os.Stat(binPath); statErr == nil {
-				_ = os.Rename(binPath, binPath+".bak")
-			}
-			res, buildErr := seatbeltRunner.RunGo(context.Background(), cfg.Agent.SourceDir, "build", "-o", binPath, "./cmd/kawa")
-			if buildErr != nil {
-				log.Error().Err(buildErr).Str("stderr", res.Stderr).Msg("Rebuild after approval failed; restoring backup binary")
-				if _, bakErr := os.Stat(binPath + ".bak"); bakErr == nil {
-					_ = os.Rename(binPath+".bak", binPath)
-				}
+			if err := atomicBuildBinary(binPath); err != nil {
+				log.Error().Err(err).Msg("Rebuild after approval failed")
 				return
 			}
 			log.Info().Str("binary", binPath).Msg("Successfully rebuilt updated Kawa binary")
@@ -136,7 +145,22 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize self-evolution engine")
 	}
 
-	// 7. Register Core Safe Tools + Custom Self-Evolved Tools
+	// 7. Initialize Extensible Communication Channels
+	router := channel.NewRouter()
+	activeChannels := 0
+	if cfg.Channels.Telegram.Enabled {
+		router.Register(channel.NewTelegramChannel(cfg.Channels.Telegram))
+		activeChannels++
+	}
+	if cfg.Channels.IMessage.Enabled {
+		router.Register(channel.NewIMessageChannel(cfg.Channels.IMessage))
+		activeChannels++
+	}
+	if *enableCLI || activeChannels == 0 {
+		router.Register(channel.NewCLIChannel())
+	}
+
+	// 8. Register Core Safe Tools + Custom Self-Evolved Tools
 	toolRegistry := tools.NewRegistry()
 	toolRegistry.Register(tools.NewReadFileTool(workspaceJail, sourceReadOnlyJail))
 	toolRegistry.Register(tools.NewWriteFileTool(workspaceJail))
@@ -153,6 +177,7 @@ func main() {
 	toolRegistry.Register(tools.NewScheduleCreateTool(sched))
 	toolRegistry.Register(tools.NewScheduleListTool(sched))
 	toolRegistry.Register(tools.NewScheduleDeleteTool(sched))
+	toolRegistry.Register(tools.NewPayloadCheckTool())
 	toolRegistry.Register(evolution.NewProposeEvolutionTool(evolveEngine, nil))
 
 	// Register any self-developed tools from internal/tools/custom_tools.go
@@ -163,34 +188,32 @@ func main() {
 		SeatbeltRunner: seatbeltRunner,
 		Memory:         memEngine,
 		Scheduler:      sched,
+		Router:         router,
 	})
 
-	// 8. Initialize Multi-Provider LLM Registry
+	// 9. Initialize Multi-Provider LLM Registry
 	llmRegistry := llm.NewRegistry(cfg.LLM, cfg.Agent.DefaultProvider)
 
-	// 9. Initialize Extensible Communication Channels
-	router := channel.NewRouter()
-	activeChannels := 0
-	if cfg.Channels.Telegram.Enabled {
-		router.Register(channel.NewTelegramChannel(cfg.Channels.Telegram))
-		activeChannels++
-	}
-	if cfg.Channels.IMessage.Enabled {
-		router.Register(channel.NewIMessageChannel(cfg.Channels.IMessage))
-		activeChannels++
-	}
-	if *enableCLI || activeChannels == 0 {
-		router.Register(channel.NewCLIChannel())
-	}
-
-	// Hot-reload callback uses syscall.Exec to replace the running process with the newly compiled binary
+	// Hot-reload callback uses syscall.Exec to replace the running process with a freshly compiled Mach-O inode
 	hotReloadFn := func() {
+		if err := atomicBuildBinary(binPath); err != nil {
+			log.Warn().Err(err).Msg("Pre-exec atomic build failed; attempting existing binary")
+		}
 		if _, err := os.Stat(binPath); err != nil {
 			return
 		}
 		log.Info().Str("binary", binPath).Msg("Hot-reloading Kawa process via syscall.Exec")
 		_ = syscall.Exec(binPath, os.Args, os.Environ())
 	}
+
+	// Listen for SIGUSR1 to allow zero-downtime hot-reload from terminal or external scripts
+	sigUSR1 := make(chan os.Signal, 1)
+	signal.Notify(sigUSR1, syscall.SIGUSR1)
+	go func() {
+		for range sigUSR1 {
+			hotReloadFn()
+		}
+	}()
 
 	// 10. Start Agent Loop with Graceful Shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -33,6 +33,11 @@ type Agent struct {
 	mu            sync.Mutex
 	sessions      map[string][]llm.Message
 	recentActions []string
+
+	queueMu      sync.Mutex
+	pendingQueue []channel.InboundMessage
+	activeTask   *ActiveTaskInfo
+	queueNotify  chan struct{}
 }
 
 func New(
@@ -57,6 +62,7 @@ func New(
 		router:       router,
 		onHotReload:  onHotReload,
 		sessions:     make(map[string][]llm.Message),
+		queueNotify:  make(chan struct{}, 1),
 	}
 	a.recordAction("Agent initialized and ready")
 	return a
@@ -66,6 +72,7 @@ func New(
 func (a *Agent) Run(ctx context.Context) error {
 	a.router.StartAll(ctx)
 	go a.checkAndSendRebootNotice(ctx)
+	go a.runQueueWorker(ctx)
 	if a.sched != nil {
 		a.sched.SetTriggerHandler(a.handleScheduledTrigger)
 		go a.sched.Start(ctx)
@@ -78,7 +85,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			log.Info().Msg("Shutting down Kawa Agent loop")
 			return nil
 		case msg := <-a.router.Inbound():
-			go a.handleInbound(ctx, msg)
+			a.enqueueOrExecuteInbound(ctx, msg)
 		}
 	}
 }
@@ -116,10 +123,13 @@ func (a *Agent) handleInbound(ctx context.Context, msg channel.InboundMessage) {
 	log.Info().
 		Str("channel", msg.ChannelName).
 		Str("sender", msg.SenderID).
+		Int("message_id", msg.MessageID).
 		Str("text", truncateLog(msg.Text, 120)).
 		Msg("Received inbound message")
 
 	a.recordAction(fmt.Sprintf("Received message from %s:%s (%s)", msg.ChannelName, msg.SenderID, truncateLog(msg.Text, 40)))
+
+	ctx = tools.WithMessageMeta(ctx, msg.MessageID, msg.ReplyToMessageID)
 
 	// Keep "typing..." status continuously active every 4s until ProcessMessage finishes
 	stopTyping := a.router.StartTyping(ctx, msg.ChannelName, msg.SenderID)
@@ -258,7 +268,7 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 					Content: resp.Content,
 				})
 				nudge := fmt.Sprintf(
-					"[System Autonomous Correction] 注意：你擁有完整的上網與檔案工具（包含 `web_search`、`web_fetch`、`list_dir`、`read_file` 等）！禁止回答「無法執行網路查詢」或只說「我將會查詢」。請針對使用者的問題 (%q)，現在立刻只輸出一行純 JSON 呼叫對應工具，例如：\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"grok ai tools\"}}",
+					"[System Autonomous Correction] 注意：你剛剛只用文字描述了動作卻沒有真正輸出 Tool Call！請針對使用者的問題 (%q)，現在立刻直接呼叫對應工具（例如 `delete_message`、`web_search`、`read_file` 等），只輸出一行純 JSON 工具呼叫，例如：\n{\"name\": \"delete_message\", \"arguments\": {}}",
 					trimmed,
 				)
 				history = a.appendSessionMessage(sessionKey, llm.Message{
@@ -356,8 +366,8 @@ func shouldAutoSaveCoreMemory(userText string) bool {
 	return false
 }
 
-// isIncompleteToolAttempt detects when a model says "好的，我將會查詢..." or ends with an unclosed ``` fence
-// because Ollama's parser stripped or truncated the <tool_call> block.
+// isIncompleteToolAttempt detects when a model says "好的，我將會查詢..." or role-plays "(正在呼叫...)"
+// without emitting an actual ToolCall.
 func isIncompleteToolAttempt(content string) bool {
 	trimmed := strings.TrimSpace(content)
 	if strings.HasSuffix(trimmed, "```json") || strings.HasSuffix(trimmed, "```xml") || strings.Contains(trimmed, "<tool_call") {
@@ -365,6 +375,12 @@ func isIncompleteToolAttempt(content string) bool {
 	}
 	if strings.HasSuffix(trimmed, "```") && strings.Count(trimmed, "```")%2 == 1 {
 		return true
+	}
+	// Detect role-played tool execution in parentheses like "（正在呼叫 Telegram...）"
+	for _, rp := range []string{"（正在呼叫", "(正在呼叫", "我現在來刪除你的訊息", "正在為您刪除"} {
+		if strings.Contains(trimmed, rp) {
+			return true
+		}
 	}
 	// If it's a very short reply promising to search/check without any actual results
 	if len([]rune(trimmed)) < 60 {
@@ -456,6 +472,10 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 		return "", false
 	}
 	cmd := strings.ToLower(fields[0])
+	// Support Telegram group commands like `/help@fanice_kawa_bot`
+	if idx := strings.Index(cmd, "@"); idx != -1 {
+		cmd = cmd[:idx]
+	}
 
 	switch cmd {
 	case "/help":
@@ -466,6 +486,9 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 			"• `/goal_auto <on|approve|off>` — 開啟/關閉背景定時自主演進成長迴圈",
 			"• `/task <功能需求>` — 與 Kawa 確認單一功能規格並產生 `TASK.md` 階段任務書",
 			"• `/run_task` — 照著 `TASK.md` 自動分階段執行程式碼開發與沙盒測試",
+			"• `/queue` — 查看目前正在思考/開發的任務與等待佇列",
+			"• `/cancel` — 立即中斷當前正在執行的思考或開發任務",
+			"• `/check` — 檢查並自動修復目前對話視窗與傳送給模型的 Payload 格式",
 			"• `/pending` — 列出所有等待人工審核的自我修改提案與 Diff",
 			"• `/approve [proposal_id]` — 核准並套用自我修改提案（自動重編譯、自我熱重啟並回報上線通知）",
 			"• `/reject <proposal_id>` — 拒絕並清理指定的自我修改提案",
@@ -477,6 +500,57 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 			"• `/sync_commands` — 將所有可用指令自動同步至 Telegram `/` 選單",
 			"• `/reset` — 清除當前短期對話視窗記憶（長期 RAG 記憶保留）",
 		}, "\n"), true
+
+	case "/queue":
+		return a.formatQueueStatus(), true
+
+	case "/cancel", "/stop":
+		return a.cancelActiveTask(), true
+
+	case "/check":
+		sessionKey := channelName + ":" + senderID
+		a.mu.Lock()
+		hist := make([]llm.Message, len(a.sessions[sessionKey]))
+		copy(hist, a.sessions[sessionKey])
+		a.mu.Unlock()
+
+		toolDefs := a.toolRegistry.Definitions()
+		sysMsg := llm.Message{
+			Role:    llm.RoleSystem,
+			Content: a.buildSystemPrompt(channelName, senderID, "格式檢查", toolDefs),
+		}
+		reqMsgs := append([]llm.Message{sysMsg}, hist...)
+		sanitizedReq, report := llm.SanitizeAndValidateRequest(llm.ChatRequest{
+			Messages: reqMsgs,
+			Tools:    toolDefs,
+		})
+
+		// Persist cleaned session history back to the session store (excluding system prompt at index 0)
+		if len(sanitizedReq.Messages) > 1 {
+			a.mu.Lock()
+			a.sessions[sessionKey] = sanitizedReq.Messages[1:]
+			a.mu.Unlock()
+		}
+
+		fixesSummary := "無異常（格式完全乾淨 ✅）"
+		if len(report.FixesApplied) > 0 {
+			fixesSummary = strings.Join(report.FixesApplied, ", ")
+		}
+		estTokens := report.TotalRunes / 2
+
+		return fmt.Sprintf(
+			"🔍 **[Pre-Flight 傳送內容與格式檢查報告]**\n"+
+				"• **訊息數量**: 原始 `%d` 則 ➔ 清理後 `%d` 則 (含 System Prompt)\n"+
+				"• **總字元數**: `%d` runes (預估 `~%d` tokens)\n"+
+				"• **自動修復項目**: %s\n\n"+
+				"✅ 目前對話視窗 (`%s`) 已完成自動淨化，且每次發送請求給模型前都會自動執行此 Pre-Flight 攔截器！",
+			report.OriginalMessages,
+			report.CleanedMessages,
+			report.TotalRunes,
+			estTokens,
+			fixesSummary,
+			sessionKey,
+		), true
 
 	case "/goal":
 		extra := strings.TrimSpace(strings.TrimPrefix(cmdLine, fields[0]))

@@ -48,9 +48,9 @@ func isTaskExecutionTrigger(text string, history []llm.Message) bool {
 	lower := strings.ToLower(cleaned)
 
 	explicitTriggers := []string{
-		"就這樣做", "照這樣做", "開始實作", "開始開發", "立刻實作",
+		"就這樣做", "照這樣做", "開始實作", "繼續實作", "繼續開發", "開始開發", "立刻實作",
 		"馬上實作", "做成 task.md", "做成task.md", "建立 task.md", "產生 task.md",
-		"直接實作", "動手實作", "幫我實作這個功能", "請開始實作", "確認實作",
+		"直接實作", "動手實作", "幫我實作", "請實作", "請開始實作", "確認實作",
 	}
 	for _, kw := range explicitTriggers {
 		if strings.Contains(lower, kw) {
@@ -130,13 +130,28 @@ func (a *Agent) DraftTaskSpecFromConversation(ctx context.Context, sessionKey, e
 	a.mu.Unlock()
 
 	var convBuilder strings.Builder
+	// If the in-memory session was recently reset or restarted, pull recent episodes from persistent RAG memory
+	if len(hist) <= 2 && a.memEngine != nil {
+		recentItems := a.memEngine.ListRecent(4)
+		for i := len(recentItems) - 1; i >= 0; i-- {
+			it := recentItems[i]
+			if it.Category == "episode" && strings.TrimSpace(it.Content) != "" {
+				convBuilder.WriteString(fmt.Sprintf("[近期對話記憶]:\n%s\n\n", truncateRunes(it.Content, 600)))
+			}
+		}
+	}
+
 	start := 0
 	if len(hist) > 8 {
 		start = len(hist) - 8
 	}
 	for _, m := range hist[start:] {
 		if m.Role == llm.RoleUser || m.Role == llm.RoleAssistant {
-			convBuilder.WriteString(fmt.Sprintf("[%s]: %s\n\n", m.Role, truncateRunes(m.Content, 600)))
+			cleanedMsg := strings.TrimSpace(llm.StripThinkingTags(m.Content))
+			if cleanedMsg == "" {
+				continue
+			}
+			convBuilder.WriteString(fmt.Sprintf("[%s]: %s\n\n", m.Role, truncateRunes(cleanedMsg, 600)))
 		}
 	}
 	if strings.TrimSpace(extraInstruction) != "" {
@@ -146,6 +161,7 @@ func (a *Agent) DraftTaskSpecFromConversation(ctx context.Context, sessionKey, e
 	// Build dynamic Go AST outlines of core candidate files so the planner knows exact struct/func names
 	candidateFiles := []string{
 		"internal/channel/telegram.go",
+		"internal/channel/channel.go",
 		"internal/tools/custom_tools.go",
 		"internal/tools/tool.go",
 		"internal/agent/agent.go",
@@ -158,50 +174,47 @@ func (a *Agent) DraftTaskSpecFromConversation(ctx context.Context, sessionKey, e
 		}
 	}
 
-	skillsGuide := a.loadRelevantDevSkills(convBuilder.String(), nil)
-
-	sysPrompt := `你是 Kawa 系統架構師。請根據對話紀錄、Go AST 檔案結構大綱與 SKILL 指南，將新功能拆解為 **2~3 個極度細小的原子級微任務 (Micro-Steps)**，並只輸出一個純 JSON 物件：
+	sysPrompt := `你是 Kawa 系統架構師。請根據【對話紀錄 / 近期對話記憶】與【現有程式碼 Go AST 大綱】，將使用者討論的新功能拆解為 **2~3 個極度細小的原子級微任務 (Micro-Steps)**，並只輸出一個純 JSON 物件（不要輸出任何其他文字或 Markdown）：
 {
-  "title": "簡短功能名稱",
+  "title": "根據對話紀錄整理出的功能名稱",
   "summary": "功能目標與架構設計摘要 (1~2 句話)",
   "requirements": [
     "具體需求 1",
     "具體需求 2"
   ],
   "target_files": [
-    "internal/channel/telegram.go"
+    "要修改或新增的檔案相對路徑"
   ],
   "steps": [
     {
       "id": "step-1",
-      "title": "在 tgUpdatesResp 新增結構欄位與輔助方法",
-      "target_file": "internal/channel/telegram.go",
+      "title": "第一步微任務標題",
+      "target_file": "要修改或新增的檔案相對路徑",
       "action": "modify",
-      "focus_symbols": ["tgUpdatesResp", "TelegramChannel"],
-      "instruction": "在 tgUpdatesResp 的 Result 中新增 InlineQuery 欄位，並為 TelegramChannel 新增 answerInlineQuery 方法呼叫 Telegram API"
+      "focus_symbols": ["實際存在於上方 Go AST 大綱中的結構或函式名稱"],
+      "instruction": "清楚描述這一步要新增或修改的欄位與方法"
     },
     {
       "id": "step-2",
-      "title": "在 Start 輪詢迴圈中串接處理邏輯",
-      "target_file": "internal/channel/telegram.go",
+      "title": "第二步微任務標題",
+      "target_file": "要修改或新增的檔案相對路徑",
       "action": "modify",
-      "focus_symbols": ["Start"],
-      "instruction": "在 Start() 的 for _, u := range updates.Result 迴圈中檢查 u.InlineQuery != nil 並呼叫 answerInlineQuery"
+      "focus_symbols": ["實際存在於上方 Go AST 大綱中的結構或函式名稱"],
+      "instruction": "清楚描述這一步要串接的邏輯"
     }
   ]
 }
 【拆解微任務鐵則（極重要）】：
-1. **每個 step 只能修改 1 個檔案中的 1~2 個函式或結構**（每次變更控制在 15~35 行內），讓小型模型能在 20 秒內寫完！
-2. ` + "`focus_symbols`" + ` 請填入上方 Go AST 大綱中實際存在的 symbol 名稱（例如 ` + "`tgUpdatesResp`、`Start`、`RegisterCustomTools`" + `）。
-3. **絕對禁止修改 ` + "`internal/tools/tool.go`" + `**。`
+1. **必須嚴格根據對話紀錄中最近討論的功能來規劃**（絕對禁止無故規劃無關的功能！）。
+2. **端到端串接鐵則（End-to-End Wiring）**：凡是讓使用者能在對話中請 Kawa 主動執行的動作（例如：刪除訊息、發送特殊通知、查詢 API、操作檔案等），如果只寫一個底層 struct method，LLM 在對話時是無法呼叫它的！你必須同時規劃在 ` + "`internal/tools/`" + ` 建立對應的 ` + "`Tool`" + ` 並在 ` + "`internal/tools/custom_tools.go`" + ` 的 ` + "`RegisterCustomTools(reg, deps)`" + ` 中註冊（` + "`deps.Router`" + ` 可直接操作通訊通道）！
+3. **每個 step 只能修改 1 個檔案中的 1~2 個函式或結構**（每次變更控制在 15~35 行內）。
+4. ` + "`focus_symbols`" + ` 請填入上方 Go AST 大綱中實際存在的 symbol 名稱（例如 ` + "`tgUpdatesResp`、`TelegramChannel`、`Start`、`Send`、`RegisterCustomTools`" + `）。
+5. **絕對禁止修改 ` + "`internal/tools/tool.go`" + `**。`
 
-	userPrompt := fmt.Sprintf("## 對話紀錄\n%s\n## 現有程式碼 Go AST 大綱\n%s\n## 開發 SKILL 指南\n%s",
-		convBuilder.String(), astOutlines.String(), skillsGuide)
+	userPrompt := fmt.Sprintf("## 對話紀錄\n%s\n## 現有程式碼 Go AST 大綱\n%s",
+		convBuilder.String(), astOutlines.String())
 
-	planCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
-	defer cancel()
-
-	resp, err := provider.Chat(planCtx, llm.ChatRequest{
+	resp, err := provider.Chat(ctx, llm.ChatRequest{
 		Messages: []llm.Message{
 			{Role: llm.RoleSystem, Content: sysPrompt},
 			{Role: llm.RoleUser, Content: userPrompt},
@@ -544,23 +557,20 @@ func (a *Agent) executeSingleMicroStep(
 請直接輸出純淨的 SEARCH/REPLACE 區塊（**絕對不要在區塊內加 ` + "```go 或 ```" + ` 符號，也不要輸出教學說明**）：
 
 <<<<<<< SEARCH
-(從上方目標檔案原始碼中，原封不動複製要修改的那幾行)
+(從上方【目標檔案相關區段原始碼】中，100% 原封不動複製要修改的那幾行)
 =======
 (替換後的新 Go 程式碼)
 >>>>>>> REPLACE
 
 【鐵則】：
-1. SEARCH 區塊內的每一行必須與上方提供的目標檔案原始碼完全一致（不要放 ` + "```go" + `）！
+1. SEARCH 區塊內的每一行必須 100% 從上方【目標檔案相關區段原始碼】原封不動複製（絕對禁止複製 SKILL 範例中的程式碼作為 SEARCH，也不要放 ` + "```go" + `）！
 2. 只需要輸出這個微任務要改的那 10~35 行，保持極速精簡！`
 	} else {
 		sysPrompt = `你是 Kawa 的 Golang 微任務開發引擎。請為目標新檔案輸出完整的 Go 原始碼：
 ` + "```go\npackage ...\n```"
 	}
 
-	stepCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
-	defer cancel()
-
-	resp, err := provider.Chat(stepCtx, llm.ChatRequest{
+	resp, err := provider.Chat(ctx, llm.ChatRequest{
 		Messages: []llm.Message{
 			{Role: llm.RoleSystem, Content: sysPrompt},
 			{Role: llm.RoleUser, Content: userPrompt.String()},
@@ -612,10 +622,7 @@ func (a *Agent) healCompilerError(ctx context.Context, provider llm.Provider, sp
 	userPrompt := fmt.Sprintf("## 編譯器報錯\n```\n%s\n```\n\n## 檔案 `%s` 報錯處局部程式碼\n```go\n%s\n```",
 		truncateRunes(compilerErr, 1200), errFile, snippet)
 
-	healCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
-	defer cancel()
-
-	resp, err := provider.Chat(healCtx, llm.ChatRequest{
+	resp, err := provider.Chat(ctx, llm.ChatRequest{
 		Messages: []llm.Message{
 			{Role: llm.RoleSystem, Content: sysPrompt},
 			{Role: llm.RoleUser, Content: userPrompt},

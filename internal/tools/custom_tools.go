@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"github.com/fanice1998/kawa/internal/channel"
 	"github.com/fanice1998/kawa/internal/config"
 	"github.com/fanice1998/kawa/internal/memory"
 	"github.com/fanice1998/kawa/internal/sandbox"
@@ -15,6 +16,7 @@ type CustomToolDeps struct {
 	SeatbeltRunner *sandbox.SeatbeltRunner
 	Memory         *memory.Engine
 	Scheduler      *scheduler.Scheduler
+	Router         *channel.Router
 }
 
 // RegisterCustomTools is the dedicated extension hook for Kawa's self-developed tools.
@@ -22,7 +24,8 @@ type CustomToolDeps struct {
 // 1. Create `internal/tools/<feature>_tool.go` (and `internal/tools/<feature>_tool_test.go`)
 // 2. Register the new tool inside `RegisterCustomTools` below.
 func RegisterCustomTools(reg *Registry, deps CustomToolDeps) {
-	_ = reg
-	_ = deps
+	if deps.Router != nil {
+		reg.Register(NewDeleteMessageTool(deps.Router))
+	}
 	// Self-evolved custom tools are registered here.
 }

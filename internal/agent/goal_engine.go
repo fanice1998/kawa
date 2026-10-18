@@ -126,10 +126,7 @@ func (a *Agent) DraftGoalRoadmap(ctx context.Context, vision string) (*GoalSpec,
 	userPrompt := fmt.Sprintf("## 使用者訂立的抽象目標\n%s\n\n## Kawa 目前的 custom_tools.go 狀態\n```go\n%s\n```",
 		vision, truncateRunes(string(customToolsData), 1500))
 
-	planCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
-	defer cancel()
-
-	resp, err := provider.Chat(planCtx, llm.ChatRequest{
+	resp, err := provider.Chat(ctx, llm.ChatRequest{
 		Messages: []llm.Message{
 			{Role: llm.RoleSystem, Content: sysPrompt},
 			{Role: llm.RoleUser, Content: userPrompt},
@@ -306,10 +303,7 @@ func (a *Agent) selfCritiqueEvolution(ctx context.Context, goal *GoalSpec, ms *G
 	userPrompt := fmt.Sprintf("## 長期目標\n%s\n\n## 當前里程碑 (%s)\n%s (%s)\n\n## 產生的 Git Diff\n```diff\n%s\n```",
 		goal.Vision, ms.ID, ms.Title, ms.Rationale, truncateRunes(prop.Diff, 2000))
 
-	critCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-
-	resp, err := provider.Chat(critCtx, llm.ChatRequest{
+	resp, err := provider.Chat(ctx, llm.ChatRequest{
 		Messages: []llm.Message{
 			{Role: llm.RoleSystem, Content: sysPrompt},
 			{Role: llm.RoleUser, Content: userPrompt},

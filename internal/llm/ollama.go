@@ -21,20 +21,29 @@ var (
 )
 
 type OllamaProvider struct {
-	baseURL string
-	model   string
-	client  *http.Client
+	baseURL     string
+	model       string
+	idleTimeout time.Duration
+	client      *http.Client
 }
 
 func NewOllamaProvider(cfg config.OllamaConfig) *OllamaProvider {
-	timeout := time.Duration(cfg.TimeoutSec) * time.Second
-	if timeout < 600*time.Second {
-		timeout = 600 * time.Second
+	idleTimeout := time.Duration(cfg.TimeoutSec) * time.Second
+	if idleTimeout < 180*time.Second {
+		idleTimeout = 180 * time.Second
 	}
 	return &OllamaProvider{
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		model:   cfg.Model,
-		client:  &http.Client{Timeout: timeout},
+		baseURL:     strings.TrimRight(cfg.BaseURL, "/"),
+		model:       cfg.Model,
+		idleTimeout: idleTimeout,
+		// Do NOT set a hard wall-clock Timeout on http.Client; use per-chunk idle watchdog instead
+		// so actively streaming responses from 27B+ models are never cut off mid-stream.
+		client: &http.Client{
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: idleTimeout,
+				IdleConnTimeout:       90 * time.Second,
+			},
+		},
 	}
 }
 
@@ -46,12 +55,14 @@ type ollamaChatReq struct {
 	Messages []ollamaMessage `json:"messages"`
 	Tools    []ollamaTool    `json:"tools,omitempty"`
 	Stream   bool            `json:"stream"`
+	Think    *bool           `json:"think,omitempty"`
 	Options  map[string]any  `json:"options,omitempty"`
 }
 
 type ollamaMessage struct {
 	Role      string           `json:"role"`
 	Content   string           `json:"content"`
+	Thinking  string           `json:"thinking,omitempty"`
 	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
 }
 
@@ -78,7 +89,26 @@ type ollamaChatResp struct {
 	Done    bool          `json:"done"`
 }
 
+// activityReader resets the watchdog timer every time bytes arrive from the Ollama stream,
+// ensuring long responses never fail with "context deadline exceeded" as long as tokens are flowing.
+type activityReader struct {
+	r     io.Reader
+	timer *time.Timer
+	idle  time.Duration
+}
+
+func (ar *activityReader) Read(p []byte) (int, error) {
+	n, err := ar.r.Read(p)
+	if n > 0 && ar.timer != nil {
+		ar.timer.Reset(ar.idle)
+	}
+	return n, err
+}
+
 func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	// Pre-flight inspection & sanitization before sending to Ollama
+	req, _ = SanitizeAndValidateRequest(req)
+
 	msgs := make([]ollamaMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		om := ollamaMessage{
@@ -86,17 +116,32 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 			Content: m.Content,
 		}
 		if m.Role == RoleTool {
-			// Qwen2.5-Coder & Hermes process tool results fastest when Role is "tool" with clean content
+			// Qwen2.5-Coder, Qwen3 & Hermes process tool results fastest when Role is "tool" with clean content
 			if m.ToolName != "" && !strings.HasPrefix(strings.TrimSpace(om.Content), "<tool_response>") {
 				om.Content = fmt.Sprintf("<tool_response>\nTool `%s` output:\n%s\n</tool_response>\n請根據以上工具執行結果，直接用繁體中文回答使用者的問題，不要再輸出 JSON。", m.ToolName, m.Content)
 			}
-		} else if len(m.ToolCalls) > 0 && strings.TrimSpace(om.Content) == "" {
-			tc := m.ToolCalls[0]
-			rawArgs := tc.Arguments
-			if strings.TrimSpace(rawArgs) == "" {
-				rawArgs = "{}"
+		} else if len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				rawArgs := strings.TrimSpace(tc.Arguments)
+				if rawArgs == "" || !json.Valid([]byte(rawArgs)) {
+					rawArgs = "{}"
+				}
+				var oc ollamaToolCall
+				oc.Function.Name = tc.Name
+				oc.Function.Arguments = json.RawMessage(rawArgs)
+				om.ToolCalls = append(om.ToolCalls, oc)
 			}
-			om.Content = fmt.Sprintf("<tool_call>\n{\"name\": %q, \"arguments\": %s}\n</tool_call>", tc.Name, rawArgs)
+			if strings.TrimSpace(om.Content) == "" && len(req.Tools) == 0 {
+				var sb strings.Builder
+				for _, tc := range m.ToolCalls {
+					rawArgs := strings.TrimSpace(tc.Arguments)
+					if rawArgs == "" {
+						rawArgs = "{}"
+					}
+					sb.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": %q, \"arguments\": %s}\n</tool_call>\n", tc.Name, rawArgs))
+				}
+				om.Content = strings.TrimSpace(sb.String())
+			}
 		}
 		msgs = append(msgs, om)
 	}
@@ -115,13 +160,18 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		})
 	}
 
+	// Disable native Qwen3/Qwen3.5/Qwen3.6 thinking chain ("think": false) so 27B models
+	// output responses, tool calls, and code patches immediately without spending 3-5 minutes on hidden thinking tokens.
+	thinkFalse := false
+
 	payload, err := json.Marshal(ollamaChatReq{
 		Model:    p.model,
 		Messages: msgs,
 		Tools:    tools,
 		Stream:   true,
+		Think:    &thinkFalse,
 		Options: map[string]any{
-			"num_ctx":     16384,
+			"num_ctx":     8192,
 			"num_predict": 4096,
 			"temperature": 0.2,
 		},
@@ -130,7 +180,17 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		return nil, fmt.Errorf("marshal ollama request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/api/chat", bytes.NewReader(payload))
+	// Create a stream context that cancels ONLY if the parent ctx is cancelled OR if no bytes arrive for p.idleTimeout
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	idleTimer := time.AfterFunc(p.idleTimeout, func() {
+		cancelStream()
+	})
+	defer func() {
+		idleTimer.Stop()
+		cancelStream()
+	}()
+
+	httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, p.baseURL+"/api/chat", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -150,11 +210,20 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	var contentBuilder strings.Builder
 	var rawToolCalls []ollamaToolCall
 
-	dec := json.NewDecoder(io.LimitReader(resp.Body, 8*1024*1024))
+	watchedBody := &activityReader{
+		r:     io.LimitReader(resp.Body, 8*1024*1024),
+		timer: idleTimer,
+		idle:  p.idleTimeout,
+	}
+	dec := json.NewDecoder(watchedBody)
 	for {
 		var chunk ollamaChatResp
 		if err := dec.Decode(&chunk); err != nil {
 			if errors.Is(err, io.EOF) {
+				break
+			}
+			// If we already received meaningful content or tool calls before a transient stream close, recover gracefully!
+			if contentBuilder.Len() > 0 || len(rawToolCalls) > 0 {
 				break
 			}
 			return nil, fmt.Errorf("decode ollama response chunk: %w", err)
@@ -165,8 +234,9 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		}
 	}
 
+	cleanContent := StripThinkingTags(contentBuilder.String())
 	out := &ChatResponse{
-		Content:  contentBuilder.String(),
+		Content:  cleanContent,
 		Provider: p.Name(),
 		Model:    p.model,
 	}
