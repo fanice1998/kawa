@@ -135,7 +135,7 @@ func (a *Agent) DraftTaskSpecFromConversation(ctx context.Context, sessionKey, e
 		recentItems := a.memEngine.ListRecent(4)
 		for i := len(recentItems) - 1; i >= 0; i-- {
 			it := recentItems[i]
-			if it.Category == "episode" && strings.TrimSpace(it.Content) != "" {
+			if (it.Category == "episodic" || it.Category == "episode") && strings.TrimSpace(it.Content) != "" {
 				convBuilder.WriteString(fmt.Sprintf("[近期對話記憶]:\n%s\n\n", truncateRunes(it.Content, 600)))
 			}
 		}

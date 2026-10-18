@@ -119,3 +119,23 @@ func TestASTOutlineAndSymbolSlicing(t *testing.T) {
 		t.Fatalf("expected sliced code to contain TargetFunc and omit unrelated Alpha struct:\n%s", sliced)
 	}
 }
+
+func TestParseBatchFeatures(t *testing.T) {
+	header, items, ok := parseBatchFeatures("分開製作以下功能 1. Telegram 流式傳輸 2. 富訊息 (Rich Messages) 3. 瞬態訊息 4. 內聯鍵盤")
+	if !ok || len(items) != 4 {
+		t.Fatalf("expected 4 items, got ok=%v items=%v", ok, items)
+	}
+	if items[1] != "富訊息 (Rich Messages)" || items[3] != "內聯鍵盤" || !strings.Contains(header, "分開製作") {
+		t.Fatalf("unexpected parse: header=%q items=%q", header, items)
+	}
+	if _, _, ok := parseBatchFeatures("幫我實作 刪除訊息"); ok {
+		t.Fatalf("single feature must not be treated as a batch")
+	}
+	if _, _, ok := parseBatchFeatures("/goal 分開做 1. a 2. b"); ok {
+		t.Fatalf("slash commands must not be treated as a batch")
+	}
+	_, multi, ok := parseBatchFeatures("請依序開發：\n1. 功能A\n2. 功能B")
+	if !ok || len(multi) != 2 {
+		t.Fatalf("expected line-based list to parse, got %v", multi)
+	}
+}

@@ -163,6 +163,12 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 		Content: trimmed,
 	})
 
+	// Multi-feature requests ("分開製作以下功能 1. A 2. B ...") are queued as sequential milestones
+	// so they are built strictly one at a time instead of being merged into a single huge task.
+	if header, items, ok := parseBatchFeatures(trimmed); ok {
+		return a.startFeatureBatch(ctx, channelName, senderID, header, items), nil
+	}
+
 	// Autonomous TASK.md Pipeline Trigger:
 	// When the user confirms a discussed feature (e.g., "就這樣做！", "開始實作", "做成 TASK.md"),
 	// automatically generate TASK.md and run Stage 1 -> Stage 2 -> Stage 3 to completion!
@@ -195,7 +201,7 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 	}
 
 	executedCalls := make(map[string]bool)
-	nudgedForLazyTool := false
+	nudgeCount := 0
 
 	for iter := 1; iter <= maxIter; iter++ {
 		reqMsgs := make([]llm.Message, 0, len(history)+1)
@@ -235,9 +241,9 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 		// Auto-Correction Guard:
 		// 1) Model lazily tells the user "你可以使用 list_dir" instead of calling it itself, OR
 		// 2) Model outputs a truncated/promised tool call like "好的，我將會查詢...\n```" without an actual ToolCall!
-		if len(resp.ToolCalls) == 0 && len(toolDefs) > 0 && !nudgedForLazyTool {
+		if len(resp.ToolCalls) == 0 && len(toolDefs) > 0 && nudgeCount < 3 {
 			if mentionedTool := mentionsToolWithoutCalling(resp.Content, toolDefs); mentionedTool != "" {
-				nudgedForLazyTool = true
+				nudgeCount++
 				log.Warn().
 					Str("mentioned_tool", mentionedTool).
 					Msg("Intercepted lazy tool mention; forcing autonomous tool execution")
@@ -258,7 +264,7 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 			}
 
 			if isIncompleteToolAttempt(resp.Content) || isFalseCapabilityRefusal(resp.Content) {
-				nudgedForLazyTool = true
+				nudgeCount++
 				log.Warn().
 					Str("content", truncateLog(resp.Content, 100)).
 					Msg("Intercepted incomplete or false-refusal response; forcing clean JSON tool call")
@@ -268,7 +274,7 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 					Content: resp.Content,
 				})
 				nudge := fmt.Sprintf(
-					"[System Autonomous Correction] 注意：你剛剛只用文字描述了動作卻沒有真正輸出 Tool Call！請針對使用者的問題 (%q)，現在立刻直接呼叫對應工具（例如 `delete_message`、`web_search`、`read_file` 等），只輸出一行純 JSON 工具呼叫，例如：\n{\"name\": \"delete_message\", \"arguments\": {}}",
+					"[System Autonomous Correction] 你上一則回覆只宣告了動作（或以冒號/刪節號結尾）卻沒有真正執行，對話因此中斷。請針對使用者的需求 (%q) 立刻繼續：若需要資訊或操作，直接呼叫對應工具（`read_file`、`list_dir`、`web_search`、`delete_message` 等）；若資訊已足夠，直接給出完整的最終回答或實作計畫。不要再只說「讓我先…」。",
 					trimmed,
 				)
 				history = a.appendSessionMessage(sessionKey, llm.Message{
@@ -308,6 +314,9 @@ func (a *Agent) ProcessMessage(ctx context.Context, channelName, senderID, text 
 			finalReply := strings.TrimSpace(resp.Content)
 			if finalReply == "" {
 				finalReply = "(模型未回傳文字內容)"
+			}
+			if isIncompleteToolAttempt(finalReply) {
+				finalReply += "\n\n⚠️ 模型在多次自動催促後仍中斷於此，沒有給出後續。請直接回覆「繼續」，或輸入 `/reset` 後重新描述需求（建議一次只做一個功能）。"
 			}
 			if a.memEngine != nil && !isCasualGreeting(trimmed) {
 				// If user explicitly asked Kawa to remember a fact/identity and the LLM didn't call memory_save,
@@ -375,6 +384,13 @@ func isIncompleteToolAttempt(content string) bool {
 	}
 	if strings.HasSuffix(trimmed, "```") && strings.Count(trimmed, "```")%2 == 1 {
 		return true
+	}
+	// Detect "announce-then-stop": the reply ends with a colon / ellipsis promising a next action
+	// (e.g. "讓我先看一下 custom_tools.go 的結構：") but never emitted a tool call.
+	for _, suffix := range []string{"：", ":", "…", "..."} {
+		if strings.HasSuffix(trimmed, suffix) {
+			return true
+		}
 	}
 	// Detect role-played tool execution in parentheses like "（正在呼叫 Telegram...）"
 	for _, rp := range []string{"（正在呼叫", "(正在呼叫", "我現在來刪除你的訊息", "正在為您刪除"} {
@@ -810,11 +826,12 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 		a.markGoalMilestoneApproved(p.ID)
 		a.recordAction(fmt.Sprintf("Approved self-evolution %s (%s)", p.ID, p.Title))
 		a.saveRebootNotice(RebootNotice{
-			ChannelName: channelName,
-			SenderID:    senderID,
-			ProposalID:  p.ID,
-			Title:       p.Title,
-			RequestedAt: time.Now().Format(time.RFC3339),
+			ChannelName:  channelName,
+			SenderID:     senderID,
+			ProposalID:   p.ID,
+			Title:        p.Title,
+			RequestedAt:  time.Now().Format(time.RFC3339),
+			ContinueGoal: a.goalChainContinues(),
 		})
 		if a.onHotReload != nil {
 			// Trigger asynchronous hot-reload after sending confirmation reply

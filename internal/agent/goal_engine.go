@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fanice1998/kawa/internal/channel"
 	"github.com/fanice1998/kawa/internal/llm"
 	"github.com/rs/zerolog/log"
 )
@@ -37,11 +38,12 @@ type GoalSpec struct {
 // RebootNotice is persisted to `.kawa/reboot_notice.json` right before `syscall.Exec`
 // so the newly booted process can immediately notify the user on Telegram that hot-reload succeeded.
 type RebootNotice struct {
-	ChannelName string `json:"channel_name"`
-	SenderID    string `json:"sender_id"`
-	ProposalID  string `json:"proposal_id"`
-	Title       string `json:"title"`
-	RequestedAt string `json:"requested_at"`
+	ChannelName  string `json:"channel_name"`
+	SenderID     string `json:"sender_id"`
+	ProposalID   string `json:"proposal_id"`
+	Title        string `json:"title"`
+	RequestedAt  string `json:"requested_at"`
+	ContinueGoal bool   `json:"continue_goal,omitempty"`
 }
 
 func (a *Agent) saveRebootNotice(notice RebootNotice) {
@@ -86,6 +88,16 @@ func (a *Agent) checkAndSendRebootNotice(ctx context.Context) {
 	)
 	if err := a.router.Send(ctx, notice.ChannelName, notice.SenderID, msg); err != nil {
 		log.Warn().Err(err).Msg("Failed to send post-reboot notification")
+	}
+
+	// Chained feature batch: automatically continue with the next pending feature.
+	if notice.ContinueGoal {
+		_ = a.router.Send(ctx, notice.ChannelName, notice.SenderID, "➡️ 佇列中還有下一項功能，自動接續開始製作...")
+		a.enqueueOrExecuteInbound(ctx, channel.InboundMessage{
+			ChannelName: notice.ChannelName,
+			SenderID:    notice.SenderID,
+			Text:        "/goal_step",
+		})
 	}
 }
 
@@ -249,11 +261,12 @@ func (a *Agent) AdvanceGoalStep(ctx context.Context, channelName, senderID strin
 			ms.Status = "COMPLETED"
 			_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
 			a.saveRebootNotice(RebootNotice{
-				ChannelName: channelName,
-				SenderID:    senderID,
-				ProposalID:  p.ID,
-				Title:       fmt.Sprintf("[GOAL %s] %s", ms.ID, ms.Title),
-				RequestedAt: time.Now().Format(time.RFC3339),
+				ChannelName:  channelName,
+				SenderID:     senderID,
+				ProposalID:   p.ID,
+				Title:        fmt.Sprintf("[GOAL %s] %s", ms.ID, ms.Title),
+				RequestedAt:  time.Now().Format(time.RFC3339),
+				ContinueGoal: a.goalChainContinues(),
 			})
 			if a.onHotReload != nil {
 				go func() {
