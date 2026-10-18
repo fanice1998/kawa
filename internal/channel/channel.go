@@ -88,6 +88,29 @@ func (r *Router) Send(ctx context.Context, channelName, recipient, text string) 
 	return ch.Send(ctx, recipient, text)
 }
 
+// SendStream sends chunks of text to a recipient via the specified channel.
+func (r *Router) SendStream(ctx context.Context, channelName, recipient string, chunks <-chan string) error {
+	r.mu.RLock()
+	ch, ok := r.channels[channelName]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("channel %q not registered", channelName)
+	}
+
+	// Check if the channel supports streaming
+	if streamer, ok := ch.(interface{ SendStream(ctx context.Context, recipient string, chunks <-chan string) error }); ok {
+		return streamer.SendStream(ctx, recipient, chunks)
+	}
+
+	// Fallback: send chunks as individual messages
+	for chunk := range chunks {
+		if err := ch.Send(ctx, recipient, chunk); err != nil {
+			return fmt.Errorf("failed to send chunk: %w", err)
+		}
+	}
+	return nil
+}
+
 // StartTyping starts a continuous "typing..." indicator on channels that support it and returns a stop function.
 func (r *Router) StartTyping(ctx context.Context, channelName, recipient string) func() {
 	r.mu.RLock()

@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -700,6 +702,15 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 			return fmt.Sprintf("❌ 執行 `TASK.md` 開發流程失敗: %v", err), true
 		}
 		return out, true
+
+	case "/task_reset":
+		if a.cfg.Sandbox.StateDir != "" {
+			taskFile := filepath.Join(a.cfg.Sandbox.StateDir, "current_task.json")
+			_ = os.Remove(taskFile)
+		}
+		rootTaskPath := filepath.Join(a.cfg.Agent.SourceDir, "TASK.md")
+		_ = os.Remove(rootTaskPath)
+		return "🗑️ 已成功清除當前 `TASK.md` 任務規格與所有暫存代碼快照！可輸入 `/task <需求>` 重新規劃。", true
 
 	case "/sync_commands":
 		if a.router == nil {

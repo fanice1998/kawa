@@ -170,7 +170,8 @@ func sliceGoFileForSymbols(src string, focusSymbols []string, instruction string
 }
 
 // extractCompilerErrorSnippet parses the first `path/to/file.go:LINE:` in compiler output
-// and extracts +/- 25 lines around that line from workingFiles so the LLM can fix it in seconds.
+// and extracts the file header (package + imports) along with +/- 25 lines around that line
+// from workingFiles so the LLM has both global import visibility and localized error context.
 func extractCompilerErrorSnippet(compilerErr string, workingFiles map[string]string) (string, string) {
 	m := compilerErrorLineRe.FindStringSubmatch(compilerErr)
 	if len(m) < 3 {
@@ -195,6 +196,16 @@ func extractCompilerErrorSnippet(compilerErr string, workingFiles map[string]str
 	}
 
 	lines := strings.Split(src, "\n")
+	// If the file is short (<= 120 lines), return the entire file for 100% full context
+	if len(lines) <= 120 {
+		return targetPath, src
+	}
+
+	headerEnd, _ := parseGoSymbols(src)
+	if headerEnd < 1 || headerEnd > len(lines) {
+		headerEnd = 1
+	}
+
 	start := lineNum - 25
 	if start < 0 {
 		start = 0
@@ -203,5 +214,18 @@ func extractCompilerErrorSnippet(compilerErr string, workingFiles map[string]str
 	if end > len(lines) {
 		end = len(lines)
 	}
-	return targetPath, strings.Join(lines[start:end], "\n")
+
+	// If the error line is already near the header, return one contiguous chunk from line 0 to end
+	if start <= headerEnd {
+		return targetPath, strings.Join(lines[:end], "\n")
+	}
+
+	// Otherwise, combine the package+import header and the localized error snippet
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("// --- 檔頭與 Import 宣告區塊 (L1-L%d) ---\n", headerEnd))
+	sb.WriteString(strings.Join(lines[:headerEnd], "\n"))
+	sb.WriteString(fmt.Sprintf("\n\n// ... (中間省略 L%d 至 L%d) ...\n\n", headerEnd+1, start))
+	sb.WriteString(fmt.Sprintf("// --- 編譯報錯處局部原始碼 (L%d-L%d) ---\n", start+1, end))
+	sb.WriteString(strings.Join(lines[start:end], "\n"))
+	return targetPath, sb.String()
 }

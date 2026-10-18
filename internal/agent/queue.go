@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -154,13 +156,24 @@ func (a *Agent) cancelActiveTask() string {
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
 
-	if a.activeTask == nil {
-		return "ℹ️ 目前沒有正在執行中的任務。"
+	if a.activeTask != nil {
+		cancelledText := truncateLog(a.activeTask.Text, 50)
+		if a.activeTask.Cancel != nil {
+			a.activeTask.Cancel()
+		}
+		remaining := len(a.pendingQueue)
+		return fmt.Sprintf("🛑 已發送中斷訊號，取消當前任務：`%s`（佇列中尚有 %d 則待處理訊息）。", cancelledText, remaining)
 	}
-	cancelledText := truncateLog(a.activeTask.Text, 50)
-	if a.activeTask.Cancel != nil {
-		a.activeTask.Cancel()
+
+	if a.cfg.Sandbox.StateDir != "" {
+		taskFile := filepath.Join(a.cfg.Sandbox.StateDir, "current_task.json")
+		if _, err := os.Stat(taskFile); err == nil {
+			_ = os.Remove(taskFile)
+			rootTaskPath := filepath.Join(a.cfg.Agent.SourceDir, "TASK.md")
+			_ = os.Remove(rootTaskPath)
+			return "🛑 目前沒有正在執行中的即時對話任務。已為您清除停滯的 `TASK.md` 與 `.kawa/current_task.json` 任務暫存！"
+		}
 	}
-	remaining := len(a.pendingQueue)
-	return fmt.Sprintf("🛑 已發送中斷訊號，取消當前任務：`%s`（佇列中尚有 %d 則待處理訊息）。", cancelledText, remaining)
+
+	return "ℹ️ 目前沒有正在執行中的任務。"
 }

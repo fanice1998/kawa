@@ -324,8 +324,19 @@ func ensureDefaultMicroSteps(spec *TaskSpec) {
 func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extraInstruction string) (string, error) {
 	sessionKey := channelName + ":" + senderID
 
+	trimmedExtra := strings.TrimSpace(extraInstruction)
+	if trimmedExtra == "reset" || trimmedExtra == "--reset" {
+		if a.cfg.Sandbox.StateDir != "" {
+			taskFile := filepath.Join(a.cfg.Sandbox.StateDir, "current_task.json")
+			_ = os.Remove(taskFile)
+		}
+		rootTaskPath := filepath.Join(a.cfg.Agent.SourceDir, "TASK.md")
+		_ = os.Remove(rootTaskPath)
+		return "🗑️ 已成功清除當前 `TASK.md` 任務規格與所有暫存代碼快照！可輸入 `/task <需求>` 重新規劃。", nil
+	}
+
 	spec, _ := a.loadTaskSpec()
-	if spec == nil || spec.Stage3Done || strings.TrimSpace(extraInstruction) != "" {
+	if spec == nil || spec.Stage3Done || trimmedExtra != "" {
 		var err error
 		spec, _, err = a.DraftTaskSpecFromConversation(ctx, sessionKey, extraInstruction)
 		if err != nil {
@@ -435,6 +446,9 @@ func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extr
 	var lastSandboxErr string
 
 	for verifyAttempt := 1; verifyAttempt <= 3; verifyAttempt++ {
+		// 1. Pre-flight: Auto-heal imports across all modified Go files before proposing
+		AutoHealAllWorkingFiles(spec.WorkingFiles)
+
 		patches := buildPatchesFromWorkingFiles(spec.WorkingFiles)
 		proposal, propErr := a.evolveEngine.Propose(ctx, spec.Title, spec.Summary, patches)
 		if propErr == nil {
@@ -443,24 +457,43 @@ func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extr
 		}
 
 		lastSandboxErr = propErr.Error()
-		log.Warn().Err(propErr).Int("attempt", verifyAttempt).Msg("Stage 3 sandbox verification failed; running targeted line-level self-heal")
+		log.Warn().Err(propErr).Int("attempt", verifyAttempt).Msg("Stage 3 sandbox verification failed")
+
+		// 2. Fast-path: Check if compiler errors are missing or unused imports (0 tokens!)
+		if HealImportsFromCompilerError(spec.WorkingFiles, lastSandboxErr) {
+			log.Info().Msg("Stage 3 compiler error healed via automated zero-token import injector; retrying verification immediately")
+			_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
+			continue
+		}
 
 		if verifyAttempt < 3 {
 			a.notifyProgress(ctx, channelName, senderID, fmt.Sprintf(
-				"🔧 **[Stage 3 局部語法自動修復 %d/3]** 沙盒編譯發現問題，正在擷取報錯行前後 25 行進行快速修復...",
+				"🔧 **[Stage 3 語法自動修復 %d/3]** 沙盒編譯發現問題，正在擷取檔頭宣告與報錯區段進行快速修復...",
 				verifyAttempt,
 			))
 			if healErr := a.healCompilerError(ctx, provider, spec, lastSandboxErr); healErr != nil {
 				log.Warn().Err(healErr).Msg("Targeted compiler error self-heal failed")
 			} else {
+				AutoHealAllWorkingFiles(spec.WorkingFiles)
 				_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
 			}
 		}
 	}
 
 	if finalProposal == nil {
+		// Roll back Stage2Done and reset the failing step so subsequent /run_task does not get stuck in a dirty snapshot loop
+		spec.Stage2Done = false
+		if failingFile, _ := extractCompilerErrorSnippet(lastSandboxErr, spec.WorkingFiles); failingFile != "" {
+			for i := range spec.Steps {
+				if spec.Steps[i].TargetFile == failingFile {
+					spec.Steps[i].Done = false
+					break
+				}
+			}
+		}
+		_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
 		return fmt.Sprintf(
-			"⚠️ `TASK.md` 開發任務 **%s** 在 Stage 3 沙盒驗證經過 3 次局部修復後仍未通過：\n\n```\n%s\n```\n你可以直接輸入 `/run_task` 再次嘗試修復，或切換模型後重試。",
+			"⚠️ `TASK.md` 開發任務 **%s** 在 Stage 3 沙盒驗證經過 3 次修復後仍未通過：\n\n```\n%s\n```\n已為您自動重置出錯步驟狀態（可直接輸入 `/run_task` 重新生成該微任務，或輸入 `/cancel` 放棄）。",
 			spec.Title, truncateRunes(lastSandboxErr, 1200),
 		), nil
 	}
@@ -587,11 +620,21 @@ func (a *Agent) executeSingleMicroStep(
 			if err != nil {
 				return "", targetPath, err
 			}
+			if strings.HasSuffix(targetPath, ".go") {
+				if healed, ok := AutoHealGoImports(updated); ok {
+					updated = healed
+				}
+			}
 			return updated, targetPath, nil
 		}
 		// Fallback if the file was very short (like custom_tools.go) and the model returned a full valid file
 		code := extractGoCodeFromSection(resp.Content)
-		if len(strings.Split(existingContent, "\n")) <= 50 && strings.Contains(code, "package ") && strings.Contains(code, "func ") {
+		if len(strings.Split(existingContent, "\n")) <= 120 && strings.Contains(code, "package ") && strings.Contains(code, "func ") {
+			if strings.HasSuffix(targetPath, ".go") {
+				if healed, ok := AutoHealGoImports(code); ok {
+					code = healed
+				}
+			}
 			return code, targetPath, nil
 		}
 		return "", targetPath, fmt.Errorf("未輸出有效的 <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE 區塊")
@@ -602,24 +645,33 @@ func (a *Agent) executeSingleMicroStep(
 	if !strings.Contains(code, "package ") {
 		return "", targetPath, fmt.Errorf("新檔案 %s 缺少有效的 package 宣告", targetPath)
 	}
+	if strings.HasSuffix(targetPath, ".go") {
+		if healed, ok := AutoHealGoImports(code); ok {
+			code = healed
+		}
+	}
 	return code, targetPath, nil
 }
 
-// healCompilerError extracts +/- 25 lines around the exact compiler error line and asks the LLM for a quick SEARCH/REPLACE fix.
+// healCompilerError extracts header and error lines around the compiler error and asks the LLM for a SEARCH/REPLACE fix.
 func (a *Agent) healCompilerError(ctx context.Context, provider llm.Provider, spec *TaskSpec, compilerErr string) error {
 	errFile, snippet := extractCompilerErrorSnippet(compilerErr, spec.WorkingFiles)
 	if errFile == "" {
 		return fmt.Errorf("compiler error did not reference any modified file in working_files")
 	}
 
-	sysPrompt := `你是 Kawa 的 Golang 編譯錯誤極速修復器。請根據編譯器報錯與局部程式碼，只輸出一個純淨的 SEARCH/REPLACE 區塊修復該錯誤（不要在內部放 ` + "```go" + `）：
+	sysPrompt := `你是 Kawa 的 Golang 編譯錯誤極速修復器。請根據編譯器報錯與提供的原始碼（含檔頭 Imports 宣告與局部程式碼），只輸出純淨的 SEARCH/REPLACE 區塊修復該錯誤（不要在內部放 ` + "```go" + `）：
 <<<<<<< SEARCH
-(原檔案中有問題的那幾行)
+(原檔案中有問題的那幾行，若需增減 import 請比對檔頭宣告)
 =======
 (修復後的正確 Go 程式碼)
->>>>>>> REPLACE`
+>>>>>>> REPLACE
 
-	userPrompt := fmt.Sprintf("## 編譯器報錯\n```\n%s\n```\n\n## 檔案 `%s` 報錯處局部程式碼\n```go\n%s\n```",
+【注意】：
+1. SEARCH 區塊內容必須 100% 原封不動從上方原始碼中複製。
+2. 若錯誤涉及型別、未定義名稱或未匯入套件，請在 import 區塊或使用處做出相應調整。`
+
+	userPrompt := fmt.Sprintf("## 編譯器報錯\n```\n%s\n```\n\n## 檔案 `%s` 原始碼區段（含檔頭或報錯處）\n```go\n%s\n```",
 		truncateRunes(compilerErr, 1200), errFile, snippet)
 
 	resp, err := provider.Chat(ctx, llm.ChatRequest{
@@ -634,7 +686,18 @@ func (a *Agent) healCompilerError(ctx context.Context, provider llm.Provider, sp
 
 	updated, err := applySearchReplaceBlocks(spec.WorkingFiles[errFile], resp.Content)
 	if err != nil {
-		return err
+		// Fallback for short files if LLM returned full code block
+		code := extractGoCodeFromSection(resp.Content)
+		if len(strings.Split(spec.WorkingFiles[errFile], "\n")) <= 120 && strings.Contains(code, "package ") && strings.Contains(code, "func ") {
+			updated = code
+		} else {
+			return err
+		}
+	}
+	if strings.HasSuffix(errFile, ".go") {
+		if healed, ok := AutoHealGoImports(updated); ok {
+			updated = healed
+		}
 	}
 	spec.WorkingFiles[errFile] = updated
 	return nil

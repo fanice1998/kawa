@@ -23,6 +23,31 @@ type TelegramChannel struct {
 	client     *http.Client
 }
 
+func (t *TelegramChannel) DeleteMessage(ctx context.Context, chatID string, messageID int) error {
+	payload, _ := json.Marshal(map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	})
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage", t.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram deleteMessage: %w", err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("telegram deleteMessage HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 func NewTelegramChannel(cfg config.TelegramChannelConfig) *TelegramChannel {
 	allowed := make(map[int64]bool, len(cfg.AllowedUserIDs))
 	for _, id := range cfg.AllowedUserIDs {
@@ -61,7 +86,48 @@ type tgUpdatesResp struct {
 				Text      string `json:"text"`
 			} `json:"reply_to_message"`
 		} `json:"message"`
+		InlineQuery *struct {
+			ID    string `json:"id"`
+			Query string `json:"query"`
+			From  struct {
+				ID       int64  `json:"id"`
+				Username string `json:"username"`
+			} `json:"from"`
+		} `json:"inline_query"`
 	} `json:"result"`
+}
+
+func (t *TelegramChannel) answerInlineQuery(ctx context.Context, queryID, queryText string) {
+	q := strings.TrimSpace(queryText)
+	if q == "" {
+		q = "請輸入想詢問 Kawa 的內容"
+	}
+	results := []map[string]any{
+		{
+			"type":        "article",
+			"id":          "kawa-inline-1",
+			"title":       "詢問 Kawa: " + q,
+			"description": "點選將此問題發送至對話視窗",
+			"input_message_content": map[string]any{
+				"message_text": q,
+			},
+		},
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"inline_query_id": queryID,
+		"results":         results,
+		"cache_time":      5,
+	})
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/answerInlineQuery", t.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := t.client.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
 }
 
 // BotCommand represents a command item in Telegram's native `/` menu.
@@ -78,6 +144,8 @@ func DefaultBotCommands() []BotCommand {
 		{Command: "goal_auto", Description: "開關背景定時自主演進 (/goal_auto on|approve|off)"},
 		{Command: "task", Description: "規劃單一新功能並產生 TASK.md 任務書"},
 		{Command: "run_task", Description: "照著 TASK.md 自動分階段開發並測試"},
+		{Command: "task_reset", Description: "清空當前停滯或出錯的 TASK.md 任務暫存 (/task_reset)"},
+		{Command: "cancel", Description: "中斷目前執行中的任務或清空停滯暫存 (/cancel)"},
 		{Command: "pending", Description: "查看待審核的自我進化 Diff 提案"},
 		{Command: "approve", Description: "核准提案並自動重編譯與熱重啟 (/approve)"},
 		{Command: "reject", Description: "拒絕並清除自我修改提案 (/reject <id>)"},
@@ -131,6 +199,11 @@ func (t *TelegramChannel) Start(ctx context.Context, inbound chan<- InboundMessa
 
 		var updates tgUpdatesResp
 		if err := json.Unmarshal(body, &updates); err != nil || !updates.OK {
+			snippet := string(body)
+			if len(snippet) > 300 {
+				snippet = snippet[:300]
+			}
+			log.Warn().Err(err).Str("body", snippet).Msg("Telegram getUpdates returned unparsable or non-OK response, retrying in 3s")
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -138,6 +211,12 @@ func (t *TelegramChannel) Start(ctx context.Context, inbound chan<- InboundMessa
 		for _, u := range updates.Result {
 			if u.UpdateID >= offset {
 				offset = u.UpdateID + 1
+			}
+			if u.InlineQuery != nil {
+				if len(t.allowedIDs) == 0 || t.allowedIDs[u.InlineQuery.From.ID] {
+					go t.answerInlineQuery(ctx, u.InlineQuery.ID, u.InlineQuery.Query)
+				}
+				continue
 			}
 			if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
 				continue
@@ -259,6 +338,25 @@ func (t *TelegramChannel) Send(ctx context.Context, recipient string, text strin
 		}
 	}
 	return nil
+}
+
+func (t *TelegramChannel) SendStream(ctx context.Context, recipient string, chunks <-chan string) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case chunk, ok := <-chunks:
+			if !ok {
+				return nil
+			}
+			if strings.TrimSpace(chunk) == "" {
+				continue
+			}
+			if err := t.Send(ctx, recipient, chunk); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func splitMessageChunks(s string, maxLen int) []string {
