@@ -65,6 +65,7 @@ func New(
 // Run processes incoming messages and starts the autonomous scheduler until ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
 	a.router.StartAll(ctx)
+	go a.checkAndSendRebootNotice(ctx)
 	if a.sched != nil {
 		a.sched.SetTriggerHandler(a.handleScheduledTrigger)
 		go a.sched.Start(ctx)
@@ -93,7 +94,13 @@ func (a *Agent) handleScheduledTrigger(ctx context.Context, job scheduler.Job) {
 		return
 	}
 
-	taskPrompt := fmt.Sprintf("[系統排程自動喚醒任務: %s]\n請立即自主呼叫所需工具完成以下排程任務，並將結果整理回報：\n%s", job.Name, job.Prompt)
+	trimmedPrompt := strings.TrimSpace(job.Prompt)
+	var taskPrompt string
+	if strings.HasPrefix(trimmedPrompt, "/") {
+		taskPrompt = trimmedPrompt
+	} else {
+		taskPrompt = fmt.Sprintf("[系統排程自動喚醒任務: %s]\n請立即自主呼叫所需工具完成以下排程任務，並將結果整理回報：\n%s", job.Name, job.Prompt)
+	}
 	reply, err := a.ProcessMessage(ctx, job.Channel, job.Recipient, taskPrompt)
 	if err != nil {
 		reply = fmt.Sprintf("⚠️ 排程任務 `%s` 執行錯誤: %v", job.Name, err)
@@ -454,23 +461,115 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 	case "/help":
 		return strings.Join([]string{
 			"🤖 **Kawa AI Agent 管理指令：**",
-			"• `/task <功能需求>` — 與 Kawa 確認新功能規格並產生 `TASK.md` 階段任務書",
+			"• `/goal <抽象目標>` — 設定長期抽象目標 (`GOAL.md`)，讓 Kawa 自動拆解多階段演進里程碑",
+			"• `/goal_step` — 推進下一個長期目標里程碑（思考方向 ➔ 微任務開發 ➔ 沙盒驗證 ➔ 自我審查）",
+			"• `/goal_auto <on|approve|off>` — 開啟/關閉背景定時自主演進成長迴圈",
+			"• `/task <功能需求>` — 與 Kawa 確認單一功能規格並產生 `TASK.md` 階段任務書",
 			"• `/run_task` — 照著 `TASK.md` 自動分階段執行程式碼開發與沙盒測試",
+			"• `/pending` — 列出所有等待人工審核的自我修改提案與 Diff",
+			"• `/approve [proposal_id]` — 核准並套用自我修改提案（自動重編譯、自我熱重啟並回報上線通知）",
+			"• `/reject <proposal_id>` — 拒絕並清理指定的自我修改提案",
+			"• `/restart` — 立即執行 `syscall.Exec` 自我熱重啟並發送上線確認訊息",
 			"• `/status` — 查看目前模型、沙盒、記憶庫、排程與待審核提案狀態",
 			"• `/provider <名稱>` — 切換 AI 模型 (`ollama`, `xai_grok`, `grok_oauth`, `claude`, `gemini`, `gemini_oauth`)",
 			"• `/memory` — 查看核心記憶 (`MEMORY.md`) 與最近 RAG 記憶項目",
 			"• `/jobs` — 列出所有執行中的定時排程任務",
-			"• `/pending` — 列出所有等待人工審核的自我修改提案與 Diff",
-			"• `/approve <proposal_id>` — 核准並套用自我修改提案（自動重編譯並熱重啟）",
-			"• `/reject <proposal_id>` — 拒絕並清理指定的自我修改提案",
 			"• `/sync_commands` — 將所有可用指令自動同步至 Telegram `/` 選單",
 			"• `/reset` — 清除當前短期對話視窗記憶（長期 RAG 記憶保留）",
-			"",
-			"💡 **如何請 Kawa 開發新功能？**",
-			"1️⃣ 直接跟 Kawa 討論你想要的功能（或輸入 `/task <需求>`）",
-			"2️⃣ 確認細節無誤後，直接說 **「就這樣做！」**、**「開始實作」** 或輸入 `/run_task`",
-			"3️⃣ Kawa 就會自動建立 `TASK.md`，並依序完成 Stage 1~3 開發與沙盒驗證！",
 		}, "\n"), true
+
+	case "/goal":
+		extra := strings.TrimSpace(strings.TrimPrefix(cmdLine, fields[0]))
+		if extra == "" {
+			if goal, err := a.loadGoalSpec(); err == nil && goal != nil {
+				return fmt.Sprintf("🌟 **目前的長期演進藍圖 (`GOAL.md`)：**\n\n%s\n👉 輸入 `/goal_step` 可立即推進下一階段里程碑，或輸入 `/goal_auto on` 開啟背景定時自主成長！", renderGoalMarkdown(goal)), true
+			}
+			return "🌟 **Kawa 長期目標自我演進引擎 (`GOAL.md`)**\n用法：`/goal <你希望 Kawa 達成的抽象長期目標>`\n範例：`/goal 成為全方位的金融與加密貨幣即時監控分析助手`", true
+		}
+		goal, md, err := a.DraftGoalRoadmap(ctx, extra)
+		if err != nil {
+			return fmt.Sprintf("❌ 規劃 `GOAL.md` 長期目標失敗: %v", err), true
+		}
+		a.recordAction(fmt.Sprintf("Set new long-term GOAL.md (%s)", truncateLog(goal.Vision, 50)))
+		return fmt.Sprintf(
+			"🌟 **已確立長期演進目標並產生 `GOAL.md` 成長藍圖：**\n\n%s\n"+
+				"---\n"+
+				"🚀 **接下來你可以：**\n"+
+				"• 輸入 `/goal_step`：讓 Kawa 現在立刻推進下一個里程碑（思考 ➔ 實作 `TASK.md` ➔ 沙盒測試 ➔ 自我審查）\n"+
+				"• 輸入 `/goal_auto on`：每小時自動在背景推進一個里程碑並送交你 `/approve`\n"+
+				"• 輸入 `/goal_auto approve`：全自動模式（通過沙盒測試與自我審查後，自動套用並 `syscall.Exec` 自我熱重啟成長！）",
+			md,
+		), true
+
+	case "/goal_step":
+		out, err := a.AdvanceGoalStep(ctx, channelName, senderID)
+		if err != nil {
+			return fmt.Sprintf("❌ 推進 `GOAL.md` 里程碑失敗: %v", err), true
+		}
+		return out, true
+
+	case "/goal_auto":
+		goal, err := a.loadGoalSpec()
+		if err != nil || goal == nil {
+			return "⚠️ 請先使用 `/goal <你的抽象目標>` 設定長期目標後，再開啟自動演進模式。", true
+		}
+		if len(fields) < 2 {
+			return fmt.Sprintf("目前自動演進模式: `%s`\n用法:\n• `/goal_auto on [週期，預設 @every 1h]` — 定時自動開發並等待你 `/approve`\n• `/goal_auto approve [週期，預設 @every 1h]` — 定時自動開發、自我審查通過後自動套用並自我重啟\n• `/goal_auto off` — 關閉定時自動演進", goal.AutoMode), true
+		}
+		sub := strings.ToLower(fields[1])
+		interval := "@every 1h"
+		if len(fields) >= 3 {
+			interval = strings.Join(fields[2:], " ")
+		}
+
+		if sub == "off" {
+			if goal.ScheduleJobID != "" && a.sched != nil {
+				a.sched.DeleteJob(goal.ScheduleJobID)
+			}
+			goal.AutoMode = "off"
+			goal.ScheduleJobID = ""
+			goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+			_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+			return "⏸️ 已關閉 `GOAL.md` 背景定時自動演進。", true
+		}
+
+		if sub != "on" && sub != "approve" {
+			return "用法: `/goal_auto <on|approve|off> [週期]`", true
+		}
+		if goal.ScheduleJobID != "" && a.sched != nil {
+			a.sched.DeleteJob(goal.ScheduleJobID)
+		}
+		if sub == "approve" {
+			goal.AutoMode = "auto_approve"
+		} else {
+			goal.AutoMode = "propose"
+		}
+		if a.sched != nil {
+			job, err := a.sched.AddJob("GOAL.md 自主演進迴圈", interval, scheduler.ModeAgentTask, "/goal_step", channelName, senderID)
+			if err != nil {
+				return fmt.Sprintf("❌ 建立自主演進排程失敗: %v", err), true
+			}
+			goal.ScheduleJobID = job.ID
+		}
+		goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+		_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+		return fmt.Sprintf("🌱 已啟動 `GOAL.md` 背景自主演進迴圈（模式: `%s`, 週期: `%s`）！\nKawa 將定時思考方向、推進下一個里程碑、執行沙盒驗證與自我審查。", goal.AutoMode, interval), true
+
+	case "/restart":
+		a.saveRebootNotice(RebootNotice{
+			ChannelName: channelName,
+			SenderID:    senderID,
+			ProposalID:  "manual-restart",
+			Title:       "手動觸發自我熱重啟",
+			RequestedAt: time.Now().Format(time.RFC3339),
+		})
+		if a.onHotReload != nil {
+			go func() {
+				time.Sleep(1200 * time.Millisecond)
+				a.onHotReload()
+			}()
+		}
+		return "🔄 正在執行 `syscall.Exec` 自我熱重啟，重啟完成後將立即發送上線確認訊息...", true
 
 	case "/task":
 		sessionKey := channelName + ":" + senderID
@@ -617,15 +716,32 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 		return strings.TrimSpace(sb.String()), true
 
 	case "/approve":
-		if len(fields) < 2 {
-			return "用法: `/approve <proposal_id>`", true
+		var id string
+		if len(fields) >= 2 {
+			id = fields[1]
+		} else {
+			pending := a.evolveEngine.ListPending()
+			if len(pending) == 1 {
+				id = pending[0].ID
+			} else if len(pending) == 0 {
+				return "目前沒有待審核的自我進化提案。", true
+			} else {
+				return "目前有多筆待審核提案，請指定 ID：`/approve <proposal_id>`（可輸入 `/pending` 查看）", true
+			}
 		}
-		id := fields[1]
 		p, err := a.evolveEngine.Approve(ctx, id)
 		if err != nil {
 			return fmt.Sprintf("❌ 核准失敗: %v", err), true
 		}
+		a.markGoalMilestoneApproved(p.ID)
 		a.recordAction(fmt.Sprintf("Approved self-evolution %s (%s)", p.ID, p.Title))
+		a.saveRebootNotice(RebootNotice{
+			ChannelName: channelName,
+			SenderID:    senderID,
+			ProposalID:  p.ID,
+			Title:       p.Title,
+			RequestedAt: time.Now().Format(time.RFC3339),
+		})
 		if a.onHotReload != nil {
 			// Trigger asynchronous hot-reload after sending confirmation reply
 			go func() {
@@ -633,7 +749,7 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 				a.onHotReload()
 			}()
 		}
-		return fmt.Sprintf("✅ 已核准並安全套用提案 `%s` (%s)！\n原始檔案已備份至 `.kawa/backups/%s`，正在重新編譯並熱重啟 Kawa 使新功能立即生效...", p.ID, p.Title, p.ID), true
+		return fmt.Sprintf("✅ 已核准並安全套用提案 `%s` (%s)！\n原始檔案已備份至 `.kawa/backups/%s`，正在重新編譯並執行 `syscall.Exec` 自我熱重啟（完成後將自動發送上線通知）...", p.ID, p.Title, p.ID), true
 
 	case "/reject":
 		if len(fields) < 2 {

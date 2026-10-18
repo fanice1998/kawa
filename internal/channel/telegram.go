@@ -68,12 +68,16 @@ type BotCommand struct {
 // DefaultBotCommands lists all commands automatically synced to Telegram via setMyCommands.
 func DefaultBotCommands() []BotCommand {
 	return []BotCommand{
-		{Command: "task", Description: "規劃新功能並產生 TASK.md 任務書"},
+		{Command: "goal", Description: "設定或查看長期抽象目標 (GOAL.md 演進藍圖)"},
+		{Command: "goal_step", Description: "立即推進下一階段長期目標並執行自我審查"},
+		{Command: "goal_auto", Description: "開關背景定時自主演進 (/goal_auto on|approve|off)"},
+		{Command: "task", Description: "規劃單一新功能並產生 TASK.md 任務書"},
 		{Command: "run_task", Description: "照著 TASK.md 自動分階段開發並測試"},
-		{Command: "status", Description: "查看模型、沙盒、記憶庫與排程狀態"},
 		{Command: "pending", Description: "查看待審核的自我進化 Diff 提案"},
-		{Command: "approve", Description: "核准並套用自我修改提案 (/approve <id>)"},
+		{Command: "approve", Description: "核准提案並自動重編譯與熱重啟 (/approve)"},
 		{Command: "reject", Description: "拒絕並清除自我修改提案 (/reject <id>)"},
+		{Command: "restart", Description: "立即執行自我熱重啟並回報上線通知"},
+		{Command: "status", Description: "查看模型、沙盒、記憶庫與排程狀態"},
 		{Command: "memory", Description: "查看核心記憶 (MEMORY.md) 與 RAG 記憶"},
 		{Command: "jobs", Description: "查看執行中的定時排程任務"},
 		{Command: "provider", Description: "切換 AI 模型 (/provider <name>)"},

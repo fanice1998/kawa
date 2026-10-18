@@ -31,7 +31,9 @@ config.toml
 
 # Kawa runtime state, sandbox worktrees, backups, logs, and workspace
 /kawa
+*.bak
 /TASK.md
+/GOAL.md
 .kawa/
 logs/
 workspace/
