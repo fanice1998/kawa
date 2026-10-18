@@ -153,7 +153,8 @@ func DefaultBotCommands() []BotCommand {
 		{Command: "status", Description: "查看模型、沙盒、記憶庫與排程狀態"},
 		{Command: "memory", Description: "查看核心記憶 (MEMORY.md) 與 RAG 記憶"},
 		{Command: "jobs", Description: "查看執行中的定時排程任務"},
-		{Command: "provider", Description: "切換 AI 模型 (/provider <name>)"},
+		{Command: "provider", Description: "切換 AI 提供者 (/provider <name>)"},
+		{Command: "model", Description: "列出或切換 Ollama 模型，重啟後保留 (/model <name>)"},
 		{Command: "sync_commands", Description: "手動將指令清單同步更新至 Telegram 選單"},
 		{Command: "reset", Description: "清除當前短期對話記憶"},
 		{Command: "help", Description: "顯示所有指令與開發流程說明"},
@@ -314,9 +315,16 @@ func (t *TelegramChannel) SyncCommands(ctx context.Context, commands []BotComman
 }
 
 func (t *TelegramChannel) Send(ctx context.Context, recipient string, text string) error {
+	return t.sendFormatted(ctx, recipient, text, nil)
+}
+
+// sendEphemeral 發送訊息並立即刪除，用於短暫提示
+func (t *TelegramChannel) sendEphemeral(ctx context.Context, chatID string, text string) error {
+	// 1. 發送訊息並獲取 MessageID
+	var messageID int
 	for _, chunk := range splitMessageChunks(text, 3900) {
 		payload, _ := json.Marshal(map[string]any{
-			"chat_id": recipient,
+			"chat_id": chatID,
 			"text":    chunk,
 		})
 		url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", t.token)
@@ -336,8 +344,106 @@ func (t *TelegramChannel) Send(ctx context.Context, recipient string, text strin
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return fmt.Errorf("telegram sendMessage HTTP %d: %s", resp.StatusCode, string(body))
 		}
+
+		// 解析 MessageID
+		var result struct {
+			OK     bool `json:"ok"`
+			Result struct {
+				MessageID int `json:"message_id"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return fmt.Errorf("failed to parse sendMessage response: %w", err)
+		}
+		if !result.OK {
+			return fmt.Errorf("telegram API error: sendMessage failed")
+		}
+		messageID = result.Result.MessageID
+	}
+
+	// 2. 立即刪除訊息
+	if messageID > 0 {
+		return t.DeleteMessage(ctx, chatID, messageID)
 	}
 	return nil
+}
+
+func (t *TelegramChannel) SendRich(ctx context.Context, recipient string, text string) error {
+	return t.sendFormatted(ctx, recipient, text, nil)
+}
+
+// SendWithKeyboard sends a message with Telegram HTML formatting and an optional inline keyboard.
+func (t *TelegramChannel) SendWithKeyboard(ctx context.Context, recipient string, text string, keyboard map[string]any) error {
+	return t.sendFormatted(ctx, recipient, text, keyboard)
+}
+
+// sendFormatted renders markdown as Telegram HTML. If Telegram rejects the entities,
+// the same chunk is sent again as plain text so the message is not dropped.
+func (t *TelegramChannel) sendFormatted(ctx context.Context, recipient, text string, keyboard map[string]any) error {
+	for _, chunk := range splitMessageChunks(text, 3500) {
+		htmlText := formatTelegramHTML(chunk)
+		parseMode := "HTML"
+		body := htmlText
+		if len(htmlText) > 4000 {
+			body = chunk
+			parseMode = ""
+		}
+		err := t.postTelegramMessage(ctx, recipient, body, parseMode, keyboard)
+		if err == nil {
+			continue
+		}
+		if parseMode == "" || !telegramEntityError(err) {
+			return err
+		}
+		if err := t.postTelegramMessage(ctx, recipient, chunk, "", keyboard); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *TelegramChannel) postTelegramMessage(ctx context.Context, recipient, text, parseMode string, keyboard map[string]any) error {
+	payloadMap := map[string]any{
+		"chat_id": recipient,
+		"text":    text,
+	}
+	if parseMode != "" {
+		payloadMap["parse_mode"] = parseMode
+	}
+	if keyboard != nil {
+		payloadMap["reply_markup"] = keyboard
+	}
+	payload, err := json.Marshal(payloadMap)
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", t.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram sendMessage: %w", err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("telegram sendMessage HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// escapeMarkdownV2 escapes special characters for MarkdownV2 parse mode
+func escapeMarkdownV2(text string) string {
+	specialChars := []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
+	result := text
+	for _, char := range specialChars {
+		result = strings.ReplaceAll(result, char, "\\"+char)
+	}
+	return result
 }
 
 func (t *TelegramChannel) SendStream(ctx context.Context, recipient string, chunks <-chan string) error {

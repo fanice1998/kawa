@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fanice1998/kawa/internal/config"
@@ -21,6 +22,7 @@ var (
 )
 
 type OllamaProvider struct {
+	mu          sync.RWMutex
 	baseURL     string
 	model       string
 	idleTimeout time.Duration
@@ -47,8 +49,97 @@ func NewOllamaProvider(cfg config.OllamaConfig) *OllamaProvider {
 	}
 }
 
-func (p *OllamaProvider) Name() string  { return "ollama" }
-func (p *OllamaProvider) Model() string { return p.model }
+func (p *OllamaProvider) Name() string { return "ollama" }
+
+func (p *OllamaProvider) Model() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.model
+}
+
+func (p *OllamaProvider) SetModel(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("model name is empty")
+	}
+	p.mu.Lock()
+	p.model = name
+	p.mu.Unlock()
+	return nil
+}
+
+type ollamaTagsResp struct {
+	Models []struct {
+		Name  string `json:"name"`
+		Model string `json:"model"`
+	} `json:"models"`
+}
+
+// ListModels returns model names from the local Ollama daemon (`GET /api/tags`).
+func (p *OllamaProvider) ListModels(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/api/tags", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama list models: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("ollama list models HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var parsed ollamaTagsResp
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode ollama tags: %w", err)
+	}
+	var names []string
+	seen := map[string]bool{}
+	for _, m := range parsed.Models {
+		name := strings.TrimSpace(m.Name)
+		if name == "" {
+			name = strings.TrimSpace(m.Model)
+		}
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// ResolveOllamaModel picks an installed model. A name without a tag matches
+// when exactly one installed model uses that base name.
+func ResolveOllamaModel(want string, available []string) (string, error) {
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return "", fmt.Errorf("模型名稱是空的")
+	}
+	if len(available) == 0 {
+		return want, nil
+	}
+	for _, name := range available {
+		if name == want {
+			return name, nil
+		}
+	}
+	var matched []string
+	for _, name := range available {
+		base := name
+		if i := strings.Index(name, ":"); i >= 0 {
+			base = name[:i]
+		}
+		if base == want {
+			matched = append(matched, name)
+		}
+	}
+	if len(matched) == 1 {
+		return matched[0], nil
+	}
+	return "", fmt.Errorf("Ollama 沒有模型 %q。可用：%s", want, strings.Join(available, ", "))
+}
 
 type ollamaChatReq struct {
 	Model    string          `json:"model"`
@@ -164,8 +255,9 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	// output responses, tool calls, and code patches immediately without spending 3-5 minutes on hidden thinking tokens.
 	thinkFalse := false
 
+	model := p.Model()
 	payload, err := json.Marshal(ollamaChatReq{
-		Model:    p.model,
+		Model:    model,
 		Messages: msgs,
 		Tools:    tools,
 		Stream:   true,
@@ -238,7 +330,7 @@ func (p *OllamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	out := &ChatResponse{
 		Content:  cleanContent,
 		Provider: p.Name(),
-		Model:    p.model,
+		Model:    model,
 	}
 	for i, tc := range rawToolCalls {
 		out.ToolCalls = append(out.ToolCalls, ToolCall{

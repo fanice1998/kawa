@@ -20,10 +20,16 @@ description: Kawa 核心自主開發工作流 (SKILL.md)：定義如何將新功
 // 替換後的新 Go 程式碼
 >>>>>>> REPLACE
 
-## 3. 常見任務拆解範例
+## 3. 做不完就再拆
+一步若寫出空檔、截斷、重複型別、註冊簽章錯誤，或工具編譯通過但呼叫方式錯誤，引擎會把這一步換成更小的步驟再做，直到深度上限。不要把同一步原樣重試三次就放棄，也不要在修復時把檔案清空。
+
+註冊工具是 `action: "register"`，由引擎依照建構子簽章寫入，不交給模型重寫 `custom_tools.go`。
+
+## 4. 常見任務拆解範例
 - **範例 A（擴充現有通訊通道，如 Telegram Inline Query）**：
   - `step-1` (`internal/channel/telegram.go`, `focus_symbols: ["tgUpdatesResp", "TelegramChannel"]`)：在 `tgUpdatesResp` 新增 `InlineQuery` 結構欄位，並為 `TelegramChannel` 新增 `answerInlineQuery` 輔助方法。
   - `step-2` (`internal/channel/telegram.go`, `focus_symbols: ["Start"]`)：在 `Start()` 的 `for _, u := range updates.Result` 迴圈中檢查 `u.InlineQuery != nil` 並呼叫處理邏輯。
 - **範例 B（新增 Agent 獨立工具 Tool）**：
-  - `step-1` (`internal/tools/<name>_tool.go`, `action: "create"`)：建立實作 `Tool` 介面的新工具檔案。
-  - `step-2` (`internal/tools/custom_tools.go`, `focus_symbols: ["RegisterCustomTools"]`)：在 `RegisterCustomTools` 中註冊新工具 `reg.Register(...)`。
+  - `step-1` (`internal/tools/<name>_tool.go`, `action: "skeleton"`)：只寫型別、建構子、Name、Description、Parameters。Execute 先回傳「尚未實作」。
+  - `step-2` (`internal/tools/<name>_tool.go`, `action: "execute"`)：只寫 Execute。
+  - `step-3` (`internal/tools/custom_tools.go`, `action: "register"`)：不要手寫 `reg.Register`，交給引擎依簽章註冊。

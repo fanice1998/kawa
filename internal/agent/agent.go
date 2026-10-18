@@ -512,7 +512,8 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 			"• `/reject <proposal_id>` — 拒絕並清理指定的自我修改提案",
 			"• `/restart` — 立即執行 `syscall.Exec` 自我熱重啟並發送上線確認訊息",
 			"• `/status` — 查看目前模型、沙盒、記憶庫、排程與待審核提案狀態",
-			"• `/provider <名稱>` — 切換 AI 模型 (`ollama`, `xai_grok`, `grok_oauth`, `claude`, `gemini`, `gemini_oauth`)",
+			"• `/provider <名稱>` — 切換 AI 提供者 (`ollama`, `xai_grok`, `grok_oauth`, `claude`, `gemini`, `gemini_oauth`)",
+			"• `/model` — 列出本機 Ollama 模型；`/model <名稱>` 切換，重啟後仍使用最後選擇",
 			"• `/memory` — 查看核心記憶 (`MEMORY.md`) 與最近 RAG 記憶項目",
 			"• `/jobs` — 列出所有執行中的定時排程任務",
 			"• `/sync_commands` — 將所有可用指令自動同步至 Telegram `/` 選單",
@@ -798,6 +799,55 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 		a.recordAction(fmt.Sprintf("Switched LLM provider to %s (%s)", p.Name(), p.Model()))
 		log.Info().Str("provider", p.Name()).Str("model", p.Model()).Msg("Switched active LLM provider")
 		return fmt.Sprintf("✅ 已切換至 Provider: %s (Model: %s)", p.Name(), p.Model()), true
+
+	case "/model":
+		ollama, ok := a.llmRegistry.Ollama()
+		if !ok {
+			return "❌ Ollama provider 未啟用。", true
+		}
+		if len(fields) < 2 {
+			models, err := ollama.ListModels(ctx)
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("目前 Ollama 模型：`%s`\n", ollama.Model()))
+			if err != nil {
+				sb.WriteString(fmt.Sprintf("無法讀取本機模型清單：%v\n", err))
+			} else if len(models) == 0 {
+				sb.WriteString("Ollama 目前沒有已安裝的模型。\n")
+			} else {
+				sb.WriteString("可用模型：\n")
+				for _, name := range models {
+					sb.WriteString("• `" + name + "`\n")
+				}
+			}
+			sb.WriteString("用法：`/model <名稱>`")
+			return strings.TrimSpace(sb.String()), true
+		}
+		want := strings.TrimSpace(strings.Join(fields[1:], " "))
+		models, listErr := ollama.ListModels(ctx)
+		var chosen string
+		if listErr != nil {
+			chosen = want
+		} else {
+			var resolveErr error
+			chosen, resolveErr = llm.ResolveOllamaModel(want, models)
+			if resolveErr != nil {
+				return "❌ " + resolveErr.Error(), true
+			}
+		}
+		if err := ollama.SetModel(chosen); err != nil {
+			return fmt.Sprintf("❌ 切換模型失敗: %v", err), true
+		}
+		a.cfg.LLM.Ollama.Model = chosen
+		if err := llm.SaveModelState(a.cfg.Sandbox.StateDir, llm.ModelState{OllamaModel: chosen}); err != nil {
+			return fmt.Sprintf("✅ 已切換 Ollama 模型為 `%s`，但沒能寫入重啟記錄：%v", chosen, err), true
+		}
+		note := ""
+		if listErr != nil {
+			note = fmt.Sprintf("\n（未能核對本機清單：%v）", listErr)
+		}
+		a.recordAction(fmt.Sprintf("Switched Ollama model to %s", chosen))
+		log.Info().Str("model", chosen).Msg("Switched Ollama model")
+		return fmt.Sprintf("✅ 已切換 Ollama 模型為 `%s`。重啟後仍會使用這個模型。%s", chosen, note), true
 
 	case "/pending":
 		pending := a.evolveEngine.ListPending()

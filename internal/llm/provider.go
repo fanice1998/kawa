@@ -116,6 +116,13 @@ func (r *Registry) SetActive(name string) error {
 	return nil
 }
 
+func (r *Registry) Ollama() (*OllamaProvider, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.providers["ollama"].(*OllamaProvider)
+	return p, ok && p != nil
+}
+
 func (r *Registry) List() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

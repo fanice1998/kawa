@@ -33,7 +33,7 @@ func isFastImmediateCommand(text string) bool {
 		cmd = cmd[:idx]
 	}
 	switch cmd {
-	case "/help", "/status", "/queue", "/cancel", "/stop", "/pending", "/jobs", "/memory", "/check", "/restart", "/sync_commands", "/provider", "/reset":
+	case "/help", "/status", "/queue", "/cancel", "/stop", "/pending", "/jobs", "/memory", "/check", "/restart", "/sync_commands", "/provider", "/model", "/reset":
 		return true
 	default:
 		return false

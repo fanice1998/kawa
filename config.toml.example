@@ -43,6 +43,7 @@ state_dir = "./.kawa"
 [llm.ollama]
 base_url = "http://127.0.0.1:11434"
 model = "qwen2.5-coder:14b"
+# /model 切換的最後選擇寫在 .kawa/llm_state.json，重啟時優先於上面這行
 timeout_sec = 300
 
 [llm.xai_grok]

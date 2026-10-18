@@ -220,77 +220,113 @@ func (a *Agent) AdvanceGoalStep(ctx context.Context, channelName, senderID strin
 		goal.Vision, ms.ID, ms.Title, ms.Rationale,
 	))
 
-	// Run the atomic TASK.md pipeline for this milestone
+	// Run the atomic TASK.md pipeline for this milestone. A failed critique becomes one
+	// smaller repair step and is run again; a failed critique is never marked complete.
 	taskInstruction := fmt.Sprintf("[長期目標: %s | 里程碑 %s: %s] %s", goal.Vision, ms.ID, ms.Title, ms.TaskPrompt)
-	taskReply, err := a.RunTaskPipeline(ctx, channelName, senderID, taskInstruction)
-	if err != nil {
-		reflection := fmt.Sprintf("[%s] 里程碑 %s (%s) 推進遭遇錯誤：%v", time.Now().Format("15:04:05"), ms.ID, ms.Title, err)
-		goal.Reflections = append(goal.Reflections, reflection)
-		goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
-		_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
-		return "", err
-	}
-
-	// Check if a verified proposal was produced in current_task.json
-	taskSpec, _ := a.loadTaskSpec()
-	if taskSpec == nil || !taskSpec.Stage3Done || taskSpec.ProposalID == "" {
-		reflection := fmt.Sprintf("[%s] 里程碑 %s (%s) 沙盒驗證未完全通過，將於下次循環修正。", time.Now().Format("15:04:05"), ms.ID, ms.Title)
-		goal.Reflections = append(goal.Reflections, reflection)
-		goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
-		_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
-		return taskReply, nil
-	}
-
-	// Self-Critique Phase: Evaluate whether the implementation direction & code diff are sound
-	critiqueSummary, passedCritique := a.selfCritiqueEvolution(ctx, goal, ms, taskSpec.ProposalID)
-	ms.ProposalID = taskSpec.ProposalID
-	ms.Critique = critiqueSummary
-	ms.Status = "NEEDS_REVIEW"
-
-	reflectionEntry := fmt.Sprintf("[%s] 完成里程碑 %s (%s) 實作與沙盒測試 (Proposal: %s)。自我審查結論：%s",
-		time.Now().Format("2006-01-02 15:04"), ms.ID, ms.Title, taskSpec.ProposalID, critiqueSummary)
-	goal.Reflections = append(goal.Reflections, reflectionEntry)
-	goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
-	_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
-
-	// If full autonomous evolution (`auto_approve`) is enabled and self-critique passed,
-	// automatically approve, rebuild, and hot-reload Kawa!
-	if goal.AutoMode == "auto_approve" && passedCritique {
-		p, appErr := a.evolveEngine.Approve(ctx, taskSpec.ProposalID)
-		if appErr == nil {
-			ms.Status = "COMPLETED"
-			_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
-			a.saveRebootNotice(RebootNotice{
-				ChannelName:  channelName,
-				SenderID:     senderID,
-				ProposalID:   p.ID,
-				Title:        fmt.Sprintf("[GOAL %s] %s", ms.ID, ms.Title),
-				RequestedAt:  time.Now().Format(time.RFC3339),
-				ContinueGoal: a.goalChainContinues(),
-			})
-			if a.onHotReload != nil {
-				go func() {
-					time.Sleep(1500 * time.Millisecond)
-					a.onHotReload()
-				}()
-			}
-			return fmt.Sprintf(
-				"🌱 **[GOAL.md 全自動進化完成]**\n"+
-					"• **里程碑**: `%s` — %s\n"+
-					"• **自我審查結果**: %s\n"+
-					"• **動作**: 已自動核准提案 `%s`，正在重新編譯並執行 `syscall.Exec` 自我熱重啟...",
-				ms.ID, ms.Title, critiqueSummary, p.ID,
-			), nil
+	var taskReply string
+	for round := 0; round < 3; round++ {
+		extra := taskInstruction
+		if round > 0 {
+			extra = ""
 		}
-	}
+		var runErr error
+		taskReply, runErr = a.RunTaskPipeline(ctx, channelName, senderID, extra)
+		if runErr != nil {
+			reflection := fmt.Sprintf("[%s] 里程碑 %s (%s) 推進遭遇錯誤：%v", time.Now().Format("15:04:05"), ms.ID, ms.Title, runErr)
+			goal.Reflections = append(goal.Reflections, reflection)
+			goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+			_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+			return "", runErr
+		}
 
-	return fmt.Sprintf(
-		"🌱 **[GOAL.md 里程碑 `%s` 開發與自我審查完成]**\n\n"+
-			"### 🧐 Kawa 自我反思與方向審查 (Self-Critique)\n"+
-			"%s\n\n"+
-			"---\n%s",
-		ms.ID, critiqueSummary, taskReply,
-	), nil
+		taskSpec, _ := a.loadTaskSpec()
+		if taskSpec == nil || !taskSpec.Stage3Done || taskSpec.ProposalID == "" {
+			reflection := fmt.Sprintf("[%s] 里程碑 %s (%s) 尚未完成。失敗的步驟會再拆小，下次循環從最小步驟繼續，不會整項重來。", time.Now().Format("15:04:05"), ms.ID, ms.Title)
+			goal.Reflections = append(goal.Reflections, reflection)
+			goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+			_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+			return taskReply, nil
+		}
+
+		critiqueSummary, passedCritique := a.selfCritiqueEvolution(ctx, goal, ms, taskSpec.ProposalID)
+		if !passedCritique && taskSpec.CritiqueRepairs < 2 {
+			taskSpec.CritiqueRepairs++
+			taskSpec.Stage2Done = false
+			taskSpec.Stage3Done = false
+			taskSpec.ProposalID = ""
+			taskSpec.Steps = append(taskSpec.Steps, repairMicroStep(taskSpec, critiqueSummary))
+			_ = a.writeTaskFiles(renderTaskMarkdown(taskSpec), taskSpec)
+			reflection := fmt.Sprintf("[%s] 里程碑 %s 自我審查未通過，已拆出一個修正步驟：%s", time.Now().Format("15:04:05"), ms.ID, truncateRunes(critiqueSummary, 180))
+			goal.Reflections = append(goal.Reflections, reflection)
+			goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+			_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+			a.notifyProgress(ctx, channelName, senderID, "🧐 自我審查沒過。不標記完成，已把問題拆成一個更小的修正步驟，繼續做。")
+			continue
+		}
+
+		ms.ProposalID = taskSpec.ProposalID
+		ms.Critique = critiqueSummary
+		if !passedCritique {
+			ms.Status = "PENDING"
+			taskSpec.Stage2Done = false
+			taskSpec.Stage3Done = false
+			taskSpec.ProposalID = ""
+			if n := len(taskSpec.Steps); n > 0 {
+				taskSpec.Steps[n-1].Done = false
+			}
+			_ = a.writeTaskFiles(renderTaskMarkdown(taskSpec), taskSpec)
+			reflectionEntry := fmt.Sprintf("[%s] 里程碑 %s (%s) 審查仍未通過，維持未完成：%s", time.Now().Format("2006-01-02 15:04"), ms.ID, ms.Title, critiqueSummary)
+			goal.Reflections = append(goal.Reflections, reflectionEntry)
+			goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+			_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+			return fmt.Sprintf("🌱 **里程碑 `%s` 審查未通過，沒有進入核准。**\n\n%s\n\n這次不會標成完成。輸入 `/goal_step` 會從最小的修正步驟繼續。", ms.ID, critiqueSummary), nil
+		}
+
+		ms.Status = "NEEDS_REVIEW"
+		reflectionEntry := fmt.Sprintf("[%s] 完成里程碑 %s (%s) 實作與沙盒測試 (Proposal: %s)。自我審查結論：%s",
+			time.Now().Format("2006-01-02 15:04"), ms.ID, ms.Title, taskSpec.ProposalID, critiqueSummary)
+		goal.Reflections = append(goal.Reflections, reflectionEntry)
+		goal.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+		_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+
+		if goal.AutoMode == "auto_approve" {
+			p, appErr := a.evolveEngine.Approve(ctx, taskSpec.ProposalID)
+			if appErr == nil {
+				ms.Status = "COMPLETED"
+				_ = a.writeGoalFiles(renderGoalMarkdown(goal), goal)
+				a.saveRebootNotice(RebootNotice{
+					ChannelName:  channelName,
+					SenderID:     senderID,
+					ProposalID:   p.ID,
+					Title:        fmt.Sprintf("[GOAL %s] %s", ms.ID, ms.Title),
+					RequestedAt:  time.Now().Format(time.RFC3339),
+					ContinueGoal: a.goalChainContinues(),
+				})
+				if a.onHotReload != nil {
+					go func() {
+						time.Sleep(1500 * time.Millisecond)
+						a.onHotReload()
+					}()
+				}
+				return fmt.Sprintf(
+					"🌱 **[GOAL.md 全自動進化完成]**\n"+
+						"• **里程碑**: `%s` — %s\n"+
+						"• **自我審查結果**: %s\n"+
+						"• **動作**: 已自動核准提案 `%s`，正在重新編譯並執行 `syscall.Exec` 自我熱重啟...",
+					ms.ID, ms.Title, critiqueSummary, p.ID,
+				), nil
+			}
+		}
+
+		return fmt.Sprintf(
+			"🌱 **[GOAL.md 里程碑 `%s` 開發與自我審查完成]**\n\n"+
+				"### 🧐 Kawa 自我反思與方向審查 (Self-Critique)\n"+
+				"%s\n\n"+
+				"---\n%s",
+			ms.ID, critiqueSummary, taskReply,
+		), nil
+	}
+	return taskReply, nil
 }
 
 // selfCritiqueEvolution inspects the generated proposal diff and verifies whether it aligns with the goal and has no logic flaws.

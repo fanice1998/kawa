@@ -57,12 +57,11 @@ func (t *ExampleTool) Execute(ctx context.Context, rawArgs string) (string, erro
 }
 ```
 
-## 微任務 Step 2：在 `internal/tools/custom_tools.go` 註冊工具
-使用 `SEARCH/REPLACE` 在 `RegisterCustomTools` 中加入一行 `reg.Register(...)`：
+## 微任務 Step 2：註冊交給引擎，不要手改 `custom_tools.go`
+建構子只允許三種簽章，引擎會照簽章寫進 `RegisterCustomTools`：
 
-<<<<<<< SEARCH
-func RegisterCustomTools(reg *Registry, deps CustomToolDeps) {
-=======
-func RegisterCustomTools(reg *Registry, deps CustomToolDeps) {
-	reg.Register(NewExampleTool())
->>>>>>> REPLACE
+- `func NewExampleTool() *ExampleTool` → `reg.Register(NewExampleTool())`
+- `func NewExampleTool(deps *CustomToolDeps) *ExampleTool` → `reg.Register(NewExampleTool(&deps))`
+- `func NewExampleTool(router *channel.Router) *ExampleTool` → `reg.Register(NewExampleTool(deps.Router))`
+
+不要自己 SEARCH/REPLACE 註冊檔，也不要為已經存在的型別再開一個新檔。通道工具呼叫 `Router.Send(ctx, channelName, recipient, text)` 時，`channelName` 必須是 `"telegram"` 這類通道名，不能把使用者 ID 放在這個位置。送富文本要先 `Router.Channel(channelName)` 再呼叫 `SendRich`。

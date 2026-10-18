@@ -111,7 +111,7 @@ func (a *Agent) startFeatureBatch(ctx context.Context, channelName, senderID, he
 			ID:        fmt.Sprintf("m-%d", i+1),
 			Title:     it,
 			Rationale: fmt.Sprintf("使用者指定的第 %d/%d 項功能，獨立製作、獨立驗證。", i+1, len(items)),
-			TaskPrompt: fmt.Sprintf("在 Kawa 中實作「%s」。這是使用者要求分開依序製作的功能之一（共 %d 項），本次只實作這一項，不要同時實作其他項目。若這是使用者可在對話中觸發的功能，需同時建立對應的 Tool 並在 RegisterCustomTools 註冊。",
+			TaskPrompt: fmt.Sprintf("在 Kawa 中實作「%s」。這是使用者要求分開依序製作的功能之一（共 %d 項），本次只實作這一項，不要同時實作其他項目。若使用者能在對話中觸發，建立對應的 Tool。不要手改 RegisterCustomTools，註冊會依照建構子簽章自動寫入。一次寫不完時，工作流會把該步繼續拆小，直到註冊與呼叫方式都正確。",
 				it, len(items)),
 			Status: "PENDING",
 		})
@@ -131,7 +131,7 @@ func (a *Agent) startFeatureBatch(ctx context.Context, channelName, senderID, he
 	for i, it := range items {
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, it))
 	}
-	sb.WriteString("\n流程：每項功能 ➔ `TASK.md` 原子微任務 ➔ 沙盒驗證 ➔ 等你 `/approve` ➔ 熱重啟 ➔ **自動接續下一項**。\n")
+	sb.WriteString("\n流程：每項功能 ➔ 小步驟（做不完就再拆） ➔ 簽章註冊與呼叫檢查 ➔ 沙盒驗證 ➔ 等你 `/approve` ➔ 熱重啟 ➔ **自動接續下一項**。\n")
 	sb.WriteString("• `/goal` 查看整體進度　• `/queue` 查看目前執行狀態　• `/cancel` 中斷當前項目\n")
 	sb.WriteString("🚀 第 1 項已開始製作...")
 	return sb.String()

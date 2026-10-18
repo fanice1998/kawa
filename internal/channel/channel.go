@@ -59,6 +59,17 @@ func (r *Router) Register(ch Channel) {
 	r.channels[ch.Name()] = ch
 }
 
+// Channel returns a registered channel by its name (for example "telegram").
+func (r *Router) Channel(name string) (Channel, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ch, ok := r.channels[name]
+	return ch, ok
+}
+
 func (r *Router) Inbound() <-chan InboundMessage {
 	return r.inbound
 }
@@ -98,7 +109,9 @@ func (r *Router) SendStream(ctx context.Context, channelName, recipient string, 
 	}
 
 	// Check if the channel supports streaming
-	if streamer, ok := ch.(interface{ SendStream(ctx context.Context, recipient string, chunks <-chan string) error }); ok {
+	if streamer, ok := ch.(interface {
+		SendStream(ctx context.Context, recipient string, chunks <-chan string) error
+	}); ok {
 		return streamer.SendStream(ctx, recipient, chunks)
 	}
 
@@ -152,4 +165,3 @@ func (r *Router) DeleteMessage(ctx context.Context, channelName, chatID string, 
 	}
 	return fmt.Errorf("channel %q does not support message deletion", channelName)
 }
-

@@ -20,25 +20,29 @@ type MicroStep struct {
 	ID           string   `json:"id"`
 	Title        string   `json:"title"`
 	TargetFile   string   `json:"target_file"`
-	Action       string   `json:"action"` // "modify" or "create"
+	Action       string   `json:"action"` // "modify", "create", "skeleton", "execute", or "register"
 	FocusSymbols []string `json:"focus_symbols,omitempty"`
 	Instruction  string   `json:"instruction"`
 	Done         bool     `json:"done"`
+	Depth        int      `json:"depth,omitempty"`
 }
 
 // TaskSpec represents the structured TASK.md plan with atomic micro-steps and persisted working file checkpoints.
 type TaskSpec struct {
-	Title        string            `json:"title"`
-	Summary      string            `json:"summary"`
-	Requirements []string          `json:"requirements"`
-	TargetFiles  []string          `json:"target_files"`
-	Steps        []MicroStep       `json:"steps"`
-	WorkingFiles map[string]string `json:"working_files,omitempty"`
-	Stage1Done   bool              `json:"stage1_done"`
-	Stage2Done   bool              `json:"stage2_done"`
-	Stage3Done   bool              `json:"stage3_done"`
-	ProposalID   string            `json:"proposal_id,omitempty"`
-	UpdatedAt    string            `json:"updated_at"`
+	Title             string            `json:"title"`
+	Summary           string            `json:"summary"`
+	Requirements      []string          `json:"requirements"`
+	TargetFiles       []string          `json:"target_files"`
+	Steps             []MicroStep       `json:"steps"`
+	WorkingFiles      map[string]string `json:"working_files,omitempty"`
+	Stage1Done        bool              `json:"stage1_done"`
+	Stage2Done        bool              `json:"stage2_done"`
+	Stage3Done        bool              `json:"stage3_done"`
+	ProposalID        string            `json:"proposal_id,omitempty"`
+	OriginInstruction string            `json:"origin_instruction,omitempty"`
+	CritiqueRepairs   int               `json:"critique_repairs,omitempty"`
+	SubdivideCount    int               `json:"subdivide_count,omitempty"`
+	UpdatedAt         string            `json:"updated_at"`
 }
 
 // isTaskExecutionTrigger detects when the user confirms a discussed feature and asks Kawa
@@ -209,7 +213,9 @@ func (a *Agent) DraftTaskSpecFromConversation(ctx context.Context, sessionKey, e
 2. **端到端串接鐵則（End-to-End Wiring）**：凡是讓使用者能在對話中請 Kawa 主動執行的動作（例如：刪除訊息、發送特殊通知、查詢 API、操作檔案等），如果只寫一個底層 struct method，LLM 在對話時是無法呼叫它的！你必須同時規劃在 ` + "`internal/tools/`" + ` 建立對應的 ` + "`Tool`" + ` 並在 ` + "`internal/tools/custom_tools.go`" + ` 的 ` + "`RegisterCustomTools(reg, deps)`" + ` 中註冊（` + "`deps.Router`" + ` 可直接操作通訊通道）！
 3. **每個 step 只能修改 1 個檔案中的 1~2 個函式或結構**（每次變更控制在 15~35 行內）。
 4. ` + "`focus_symbols`" + ` 請填入上方 Go AST 大綱中實際存在的 symbol 名稱（例如 ` + "`tgUpdatesResp`、`TelegramChannel`、`Start`、`Send`、`RegisterCustomTools`" + `）。
-5. **絕對禁止修改 ` + "`internal/tools/tool.go`" + `**。`
+5. **絕對禁止修改 ` + "`internal/tools/tool.go`" + `**。
+6. **新增工具必須拆成三步**：` + "`skeleton`" + `（只有型別、建構子、Name、Description、Parameters，Execute 先回傳「尚未實作」）、` + "`execute`" + `（只寫 Execute）、` + "`register`" + `（action 填 register，不要自己改 RegisterCustomTools）。
+7. **不要為已經存在的型別再開一個新檔**。註冊由引擎依照建構子簽章寫入，建構子只能是無參數、` + "`*CustomToolDeps`" + ` 或 ` + "`*channel.Router`" + `。`
 
 	userPrompt := fmt.Sprintf("## 對話紀錄\n%s\n## 現有程式碼 Go AST 大綱\n%s",
 		convBuilder.String(), astOutlines.String())
@@ -252,6 +258,7 @@ func (a *Agent) DraftTaskSpecFromConversation(ctx context.Context, sessionKey, e
 	}
 
 	ensureDefaultMicroSteps(spec)
+	spec.Steps = expandOversizedSteps(spec.Steps)
 
 	mdContent := renderTaskMarkdown(spec)
 	if err := a.writeTaskFiles(mdContent, spec); err != nil {
@@ -336,14 +343,20 @@ func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extr
 	}
 
 	spec, _ := a.loadTaskSpec()
-	if spec == nil || spec.Stage3Done || trimmedExtra != "" {
+	if !shouldResumeTask(spec, trimmedExtra) {
 		var err error
 		spec, _, err = a.DraftTaskSpecFromConversation(ctx, sessionKey, extraInstruction)
 		if err != nil {
 			return "", err
 		}
+		spec.OriginInstruction = trimmedExtra
+	}
+	if spec.OriginInstruction == "" {
+		spec.OriginInstruction = trimmedExtra
 	}
 	ensureDefaultMicroSteps(spec)
+	spec.Steps = expandOversizedSteps(spec.Steps)
+	purgeEmptyGoFiles(spec)
 
 	a.notifyProgress(ctx, channelName, senderID, fmt.Sprintf(
 		"📋 **已啟動 `TASK.md` 原子微任務開發引擎：%s**\n\n%s\n🚀 共拆分為 **%d 個原子微任務**，現在開始依序執行...",
@@ -386,49 +399,8 @@ func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extr
 		return "", err
 	}
 
-	for i := range spec.Steps {
-		step := &spec.Steps[i]
-		if step.Done {
-			continue
-		}
-
-		a.notifyProgress(ctx, channelName, senderID, fmt.Sprintf(
-			"🔨 **[微任務 %d/%d: `%s`]** 正在執行：**%s** (目標檔案: `%s`)...",
-			i+1, len(spec.Steps), step.ID, step.Title, step.TargetFile,
-		))
-
-		var stepErr error
-		for stepAttempt := 1; stepAttempt <= 3; stepAttempt++ {
-			updatedCode, targetPath, err := a.executeSingleMicroStep(ctx, provider, spec, step, skillsGuide, stepErr, stepAttempt)
-			if err != nil {
-				stepErr = err
-				log.Warn().
-					Err(err).
-					Str("step_id", step.ID).
-					Int("attempt", stepAttempt).
-					Msg("Atomic micro-step failed; retrying single step")
-				continue
-			}
-
-			spec.WorkingFiles[targetPath] = updatedCode
-			step.Done = true
-			spec.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
-			_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
-			stepErr = nil
-			break
-		}
-
-		if stepErr != nil {
-			return fmt.Sprintf(
-				"⚠️ 微任務 **%s (%s)** 在嘗試 3 次後仍未成功：\n```\n%v\n```\n已完成的前置微任務已自動保存於 `.kawa/current_task.json`，可直接輸入 `/run_task` 接續重試！",
-				step.ID, step.Title, stepErr,
-			), nil
-		}
-
-		a.notifyProgress(ctx, channelName, senderID, fmt.Sprintf(
-			"✅ **[微任務 %d/%d 完成]** `%s` — **%s** 已寫入暫存區並更新 `TASK.md`！",
-			i+1, len(spec.Steps), step.ID, step.Title,
-		))
+	if failMsg, ok := a.executePendingSteps(ctx, provider, spec, skillsGuide, channelName, senderID); !ok {
+		return failMsg, nil
 	}
 
 	spec.Stage2Done = true
@@ -444,10 +416,34 @@ func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extr
 
 	var finalProposal *evolution.Proposal
 	var lastSandboxErr string
+	var prevSandboxErr string
 
-	for verifyAttempt := 1; verifyAttempt <= 3; verifyAttempt++ {
-		// 1. Pre-flight: Auto-heal imports across all modified Go files before proposing
+	for verifyAttempt := 1; verifyAttempt <= 4; verifyAttempt++ {
 		AutoHealAllWorkingFiles(spec.WorkingFiles)
+
+		if _, regErr := a.ensureToolRegistration(spec); regErr != nil {
+			lastSandboxErr = regErr.Error()
+			log.Warn().Err(regErr).Int("attempt", verifyAttempt).Msg("Mechanical tool registration failed")
+			if ok, msg := a.subdivideFromFailure(ctx, provider, spec, skillsGuide, channelName, senderID, lastSandboxErr); ok {
+				prevSandboxErr = ""
+				continue
+			} else if msg != "" {
+				lastSandboxErr = msg
+			}
+			break
+		}
+
+		if wireErr := auditToolWiring(spec.WorkingFiles, spec.Steps, spec.Summary+" "+strings.Join(spec.Requirements, " ")); wireErr != nil {
+			lastSandboxErr = wireErr.Error()
+			log.Warn().Err(wireErr).Int("attempt", verifyAttempt).Msg("Tool wiring audit failed before sandbox")
+			if ok, msg := a.subdivideFromFailure(ctx, provider, spec, skillsGuide, channelName, senderID, lastSandboxErr); ok {
+				prevSandboxErr = ""
+				continue
+			} else if msg != "" {
+				lastSandboxErr = msg
+			}
+			break
+		}
 
 		patches := buildPatchesFromWorkingFiles(spec.WorkingFiles)
 		proposal, propErr := a.evolveEngine.Propose(ctx, spec.Title, spec.Summary, patches)
@@ -459,25 +455,75 @@ func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extr
 		lastSandboxErr = propErr.Error()
 		log.Warn().Err(propErr).Int("attempt", verifyAttempt).Msg("Stage 3 sandbox verification failed")
 
-		// 2. Fast-path: Check if compiler errors are missing or unused imports (0 tokens!)
+		if lastSandboxErr == prevSandboxErr {
+			log.Warn().Msg("Sandbox error unchanged after repair; subdividing the failing step")
+			if ok, msg := a.subdivideFromFailure(ctx, provider, spec, skillsGuide, channelName, senderID, lastSandboxErr); ok {
+				prevSandboxErr = ""
+				continue
+			} else if msg != "" {
+				lastSandboxErr = msg
+			}
+			break
+		}
+		prevSandboxErr = lastSandboxErr
+
+		if classifyFailure(lastSandboxErr) == failureRedeclared {
+			if dropped := dropRedeclaredFile(spec.WorkingFiles, lastSandboxErr); dropped != "" {
+				log.Info().Str("file", dropped).Msg("Dropped redeclared duplicate tool file")
+				for i := range spec.Steps {
+					if spec.Steps[i].TargetFile == dropped {
+						spec.Steps[i].Done = false
+					}
+				}
+			}
+		}
+
 		if HealImportsFromCompilerError(spec.WorkingFiles, lastSandboxErr) {
 			log.Info().Msg("Stage 3 compiler error healed via automated zero-token import injector; retrying verification immediately")
 			_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
+			prevSandboxErr = ""
 			continue
 		}
 
-		if verifyAttempt < 3 {
-			a.notifyProgress(ctx, channelName, senderID, fmt.Sprintf(
-				"🔧 **[Stage 3 語法自動修復 %d/3]** 沙盒編譯發現問題，正在擷取檔頭宣告與報錯區段進行快速修復...",
-				verifyAttempt,
-			))
-			if healErr := a.healCompilerError(ctx, provider, spec, lastSandboxErr); healErr != nil {
+		if verifyAttempt == 4 {
+			break
+		}
+
+		errFile, _ := extractCompilerErrorSnippet(lastSandboxErr, spec.WorkingFiles)
+		before := ""
+		if errFile != "" {
+			before = spec.WorkingFiles[errFile]
+		}
+
+		a.notifyProgress(ctx, channelName, senderID, fmt.Sprintf(
+			"🔧 **[Stage 3 修復 %d/4]** 沙盒沒過。先做局部修復；修不好就把這一步再拆小，直到能完成。",
+			verifyAttempt,
+		))
+		healErr := a.healCompilerError(ctx, provider, spec, lastSandboxErr)
+		worse := errFile != "" && goFileWorse(before, spec.WorkingFiles[errFile])
+		if healErr != nil || worse {
+			if errFile != "" {
+				if strings.TrimSpace(before) == "" {
+					delete(spec.WorkingFiles, errFile)
+				} else {
+					spec.WorkingFiles[errFile] = before
+				}
+			}
+			if healErr != nil {
 				log.Warn().Err(healErr).Msg("Targeted compiler error self-heal failed")
 			} else {
-				AutoHealAllWorkingFiles(spec.WorkingFiles)
-				_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
+				log.Warn().Str("file", errFile).Msg("Self-heal produced a worse file; restored the previous copy")
 			}
+			if ok, msg := a.subdivideFromFailure(ctx, provider, spec, skillsGuide, channelName, senderID, lastSandboxErr); ok {
+				prevSandboxErr = ""
+				continue
+			} else if msg != "" {
+				lastSandboxErr = msg
+			}
+			break
 		}
+		AutoHealAllWorkingFiles(spec.WorkingFiles)
+		_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
 	}
 
 	if finalProposal == nil {
@@ -493,7 +539,7 @@ func (a *Agent) RunTaskPipeline(ctx context.Context, channelName, senderID, extr
 		}
 		_ = a.writeTaskFiles(renderTaskMarkdown(spec), spec)
 		return fmt.Sprintf(
-			"⚠️ `TASK.md` 開發任務 **%s** 在 Stage 3 沙盒驗證經過 3 次修復後仍未通過：\n\n```\n%s\n```\n已為您自動重置出錯步驟狀態（可直接輸入 `/run_task` 重新生成該微任務，或輸入 `/cancel` 放棄）。",
+			"⚠️ `TASK.md` 開發任務 **%s** 在把失敗步驟拆到不能再拆之後仍未通過：\n\n```\n%s\n```\n已保留完成的步驟。輸入 `/run_task` 會從這個最小步驟繼續，不會整份重來。",
 			spec.Title, truncateRunes(lastSandboxErr, 1200),
 		), nil
 	}
@@ -582,6 +628,12 @@ func (a *Agent) executeSingleMicroStep(
 
 	if prevErr != nil {
 		userPrompt.WriteString(fmt.Sprintf("\n## ⚠️ 前一次嘗試錯誤 (第 %d 次重試，請修正格式)\n```\n%v\n```\n", attempt-1, prevErr))
+	}
+	switch step.Action {
+	case "skeleton":
+		userPrompt.WriteString("\n## 本步限制\n只寫骨架：型別、建構子、Name、Description、Parameters。Execute 固定 `return \"\", fmt.Errorf(\"尚未實作\")`。不要寫業務邏輯，不要註冊，不超過 40 行。\n")
+	case "execute":
+		userPrompt.WriteString("\n## 本步限制\n只補 Execute（和它直接需要的未匯出輔助函式）。不要重寫 Name、Description、Parameters，不要註冊。替換內容不超過 40 行。\n")
 	}
 
 	var sysPrompt string
@@ -698,6 +750,9 @@ func (a *Agent) healCompilerError(ctx context.Context, provider llm.Provider, sp
 		if healed, ok := AutoHealGoImports(updated); ok {
 			updated = healed
 		}
+	}
+	if goFileWorse(spec.WorkingFiles[errFile], updated) {
+		return fmt.Errorf("修復結果不是完整可解析的 Go 檔案，已捨棄")
 	}
 	spec.WorkingFiles[errFile] = updated
 	return nil

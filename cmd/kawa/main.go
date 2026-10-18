@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -193,6 +194,13 @@ func main() {
 
 	// 9. Initialize Multi-Provider LLM Registry
 	llmRegistry := llm.NewRegistry(cfg.LLM, cfg.Agent.DefaultProvider)
+	if st, stErr := llm.LoadModelState(cfg.Sandbox.StateDir); stErr == nil && strings.TrimSpace(st.OllamaModel) != "" {
+		if p, ok := llmRegistry.Ollama(); ok {
+			_ = p.SetModel(st.OllamaModel)
+			cfg.LLM.Ollama.Model = st.OllamaModel
+			log.Info().Str("model", st.OllamaModel).Msg("Restored last Ollama model")
+		}
+	}
 
 	// Hot-reload callback uses syscall.Exec to replace the running process with a freshly compiled Mach-O inode
 	hotReloadFn := func() {

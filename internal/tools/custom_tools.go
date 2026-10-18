@@ -26,6 +26,8 @@ type CustomToolDeps struct {
 func RegisterCustomTools(reg *Registry, deps CustomToolDeps) {
 	if deps.Router != nil {
 		reg.Register(NewDeleteMessageTool(deps.Router))
+		reg.Register(NewSendRichMessageTool(&deps))
 	}
 	// Self-evolved custom tools are registered here.
+	// reg.Register(NewSendInlineKeyboardTool(deps.Router))
 }
