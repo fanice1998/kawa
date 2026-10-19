@@ -43,7 +43,7 @@ state_dir = "./.kawa"
 [llm.ollama]
 base_url = "http://127.0.0.1:11434"
 model = "qwen2.5-coder:14b"
-# /model 切換的最後選擇寫在 .kawa/llm_state.json，重啟時優先於上面這行
+# /provider 與 /model 的最後選擇寫在 .kawa/llm_state.json，重啟時優先於設定檔
 timeout_sec = 300
 
 [llm.xai_grok]
@@ -54,6 +54,7 @@ timeout_sec = 120
 
 [llm.grok_oauth]
 base_url = "https://api.x.ai/v1"
+# 啟動預設。/model 優先讀本機 ~/.grok/models_cache.json；沒有這份快取才問 API
 model = "grok-2-latest"
 access_token = "YOUR_GROK_OAUTH_ACCESS_TOKEN"
 refresh_token = "YOUR_GROK_OAUTH_REFRESH_TOKEN"

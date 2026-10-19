@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fanice1998/kawa/internal/config"
@@ -15,6 +17,7 @@ import (
 
 // GeminiProvider implements both `gemini` (API Key) and `gemini_oauth` (Google OAuth2 with auto-refresh).
 type GeminiProvider struct {
+	mu        sync.RWMutex
 	name      string
 	baseURL   string
 	model     string
@@ -53,8 +56,62 @@ func NewGeminiOAuthProvider(cfg config.OAuthModelConfig) *GeminiProvider {
 	}
 }
 
-func (p *GeminiProvider) Name() string  { return p.name }
-func (p *GeminiProvider) Model() string { return p.model }
+func (p *GeminiProvider) Name() string { return p.name }
+
+func (p *GeminiProvider) Model() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.model
+}
+
+func (p *GeminiProvider) SetModel(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("model name is empty")
+	}
+	p.mu.Lock()
+	p.model = name
+	p.mu.Unlock()
+	return nil
+}
+
+// ListModels calls GET {baseURL}/models and keeps models that support generateContent.
+func (p *GeminiProvider) ListModels(ctx context.Context) ([]ListedModel, error) {
+	var all []ListedModel
+	pageToken := ""
+	for page := 0; page < 5; page++ {
+		q := url.Values{}
+		q.Set("pageSize", "100")
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		endpoint := p.baseURL + "/models?" + q.Encode()
+		body, status, err := p.authorizedGET(ctx, endpoint, false)
+		if err != nil {
+			return nil, err
+		}
+		if status == http.StatusUnauthorized && p.oauthMgr != nil {
+			body, status, err = p.authorizedGET(ctx, endpoint, true)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if status < 200 || status >= 300 {
+			return nil, fmt.Errorf("%s list models HTTP %d: %s", p.name, status, clipBody(body))
+		}
+		env, models, err := decodeModelPage(body, true)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, models...)
+		next := strings.TrimSpace(env.NextPageToken)
+		if next == "" || next == pageToken {
+			break
+		}
+		pageToken = next
+	}
+	return dedupeListed(all), nil
+}
 
 type geminiReq struct {
 	SystemInstruction *geminiContent     `json:"systemInstruction,omitempty"`
@@ -100,6 +157,7 @@ type geminiResp struct {
 }
 
 func (p *GeminiProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	model := p.Model()
 	var sysParts []geminiPart
 	var contents []geminiContent
 
@@ -179,12 +237,12 @@ func (p *GeminiProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		return nil, fmt.Errorf("marshal %s request: %w", p.name, err)
 	}
 
-	body, status, err := p.doRequest(ctx, payload, false)
+	body, status, err := p.doRequest(ctx, model, payload, false)
 	if err != nil {
 		return nil, err
 	}
 	if status == http.StatusUnauthorized && p.oauthMgr != nil {
-		body, status, err = p.doRequest(ctx, payload, true)
+		body, status, err = p.doRequest(ctx, model, payload, true)
 		if err != nil {
 			return nil, err
 		}
@@ -204,7 +262,7 @@ func (p *GeminiProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 
 	out := &ChatResponse{
 		Provider: p.Name(),
-		Model:    p.model,
+		Model:    model,
 	}
 	var textParts []string
 	for i, part := range gResp.Candidates[0].Content.Parts {
@@ -223,30 +281,55 @@ func (p *GeminiProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	return out, nil
 }
 
-func (p *GeminiProvider) doRequest(ctx context.Context, payload []byte, forceRefresh bool) ([]byte, int, error) {
-	endpoint := fmt.Sprintf("%s/models/%s:generateContent", p.baseURL, p.model)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return nil, 0, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
+func (p *GeminiProvider) authorize(ctx context.Context, req *http.Request, forceRefresh bool) error {
 	if p.oauthMgr != nil {
 		var tok string
+		var err error
 		if forceRefresh {
 			tok, err = p.oauthMgr.ForceRefresh(ctx)
 		} else {
 			tok, err = p.oauthMgr.GetToken(ctx)
 		}
 		if err != nil {
-			return nil, 0, err
+			return err
 		}
-		httpReq.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Authorization", "Bearer "+tok)
 		if p.projectID != "" {
-			httpReq.Header.Set("x-goog-user-project", p.projectID)
+			req.Header.Set("x-goog-user-project", p.projectID)
 		}
-	} else {
-		httpReq.Header.Set("x-goog-api-key", p.apiKey)
+		return nil
+	}
+	req.Header.Set("x-goog-api-key", p.apiKey)
+	return nil
+}
+
+func (p *GeminiProvider) authorizedGET(ctx context.Context, endpoint string, forceRefresh bool) ([]byte, int, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	if err := p.authorize(ctx, httpReq, forceRefresh); err != nil {
+		return nil, 0, err
+	}
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s list models: %w", p.name, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	return body, resp.StatusCode, nil
+}
+
+func (p *GeminiProvider) doRequest(ctx context.Context, model string, payload []byte, forceRefresh bool) ([]byte, int, error) {
+	endpoint := fmt.Sprintf("%s/models/%s:generateContent", p.baseURL, model)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if err := p.authorize(ctx, httpReq, forceRefresh); err != nil {
+		return nil, 0, err
 	}
 
 	resp, err := p.client.Do(httpReq)

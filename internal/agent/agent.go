@@ -512,8 +512,8 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 			"• `/reject <proposal_id>` — 拒絕並清理指定的自我修改提案",
 			"• `/restart` — 立即執行 `syscall.Exec` 自我熱重啟並發送上線確認訊息",
 			"• `/status` — 查看目前模型、沙盒、記憶庫、排程與待審核提案狀態",
-			"• `/provider <名稱>` — 切換 AI 提供者 (`ollama`, `xai_grok`, `grok_oauth`, `claude`, `gemini`, `gemini_oauth`)",
-			"• `/model` — 列出本機 Ollama 模型；`/model <名稱>` 切換，重啟後仍使用最後選擇",
+			"• `/provider` — 列出提供者；`/provider <名稱>` 切換，重啟後仍使用最後選擇",
+			"• `/model` — 列出目前 provider 的模型（Grok 讀本機 ~/.grok/models_cache.json）；`/model <名稱>` 切換，重啟後保留",
 			"• `/memory` — 查看核心記憶 (`MEMORY.md`) 與最近 RAG 記憶項目",
 			"• `/jobs` — 列出所有執行中的定時排程任務",
 			"• `/sync_commands` — 將所有可用指令自動同步至 Telegram `/` 選單",
@@ -789,65 +789,85 @@ func (a *Agent) handleCommand(ctx context.Context, channelName, senderID, cmdLin
 
 	case "/provider":
 		if len(fields) < 2 {
-			return fmt.Sprintf("可用 Providers: %s\n用法: `/provider <name>`", strings.Join(a.llmRegistry.List(), ", ")), true
+			cur, _ := a.llmRegistry.Active()
+			curLine := "目前沒有啟用中的 Provider。"
+			if cur != nil {
+				curLine = fmt.Sprintf("目前 Provider：`%s`（模型 `%s`）", cur.Name(), cur.Model())
+			}
+			return fmt.Sprintf("%s\n可用 Providers: %s\n用法: `/provider <name>`", curLine, strings.Join(a.llmRegistry.List(), ", ")), true
 		}
 		target := strings.ToLower(fields[1])
 		if err := a.llmRegistry.SetActive(target); err != nil {
 			return fmt.Sprintf("❌ 切換失敗: %v", err), true
 		}
 		p, _ := a.llmRegistry.Active()
+		if a.cfg != nil {
+			a.cfg.Agent.DefaultProvider = p.Name()
+		}
+		if err := llm.PersistActiveProvider(a.cfg.Sandbox.StateDir, p.Name()); err != nil {
+			a.recordAction(fmt.Sprintf("Switched LLM provider to %s (%s)", p.Name(), p.Model()))
+			return fmt.Sprintf("✅ 已切換至 Provider: %s (Model: %s)，但沒能寫入重啟記錄：%v", p.Name(), p.Model(), err), true
+		}
 		a.recordAction(fmt.Sprintf("Switched LLM provider to %s (%s)", p.Name(), p.Model()))
 		log.Info().Str("provider", p.Name()).Str("model", p.Model()).Msg("Switched active LLM provider")
-		return fmt.Sprintf("✅ 已切換至 Provider: %s (Model: %s)", p.Name(), p.Model()), true
+		return fmt.Sprintf("✅ 已切換至 Provider: %s (Model: %s)。重啟後仍會使用這個提供者。", p.Name(), p.Model()), true
 
 	case "/model":
-		ollama, ok := a.llmRegistry.Ollama()
+		p, err := a.llmRegistry.Active()
+		if err != nil || p == nil {
+			return "❌ 沒有啟用中的 Provider。", true
+		}
+		cat, ok := llm.Catalog(p)
 		if !ok {
-			return "❌ Ollama provider 未啟用。", true
+			return fmt.Sprintf("Provider `%s` 還沒有接上模型清單 API。", p.Name()), true
 		}
 		if len(fields) < 2 {
-			models, err := ollama.ListModels(ctx)
+			models, listErr := cat.ListModels(ctx)
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("目前 Ollama 模型：`%s`\n", ollama.Model()))
-			if err != nil {
-				sb.WriteString(fmt.Sprintf("無法讀取本機模型清單：%v\n", err))
+			sb.WriteString(fmt.Sprintf("目前 %s 模型：`%s`\n", cat.Name(), cat.Model()))
+			if note := llm.CatalogNote(cat); note != "" {
+				sb.WriteString(note + "\n")
+			}
+			if listErr != nil {
+				sb.WriteString(fmt.Sprintf("無法取得 %s 的模型清單：%v\n", cat.Name(), listErr))
 			} else if len(models) == 0 {
-				sb.WriteString("Ollama 目前沒有已安裝的模型。\n")
+				sb.WriteString("沒有可選模型。\n")
 			} else {
 				sb.WriteString("可用模型：\n")
-				for _, name := range models {
-					sb.WriteString("• `" + name + "`\n")
-				}
+				sb.WriteString(llm.FormatListedModels(models))
+				sb.WriteString("\n")
 			}
 			sb.WriteString("用法：`/model <名稱>`")
 			return strings.TrimSpace(sb.String()), true
 		}
 		want := strings.TrimSpace(strings.Join(fields[1:], " "))
-		models, listErr := ollama.ListModels(ctx)
+		models, listErr := cat.ListModels(ctx)
 		var chosen string
 		if listErr != nil {
 			chosen = want
 		} else {
 			var resolveErr error
-			chosen, resolveErr = llm.ResolveOllamaModel(want, models)
+			chosen, resolveErr = llm.ResolveCatalogModel(cat.Name(), want, models)
 			if resolveErr != nil {
 				return "❌ " + resolveErr.Error(), true
 			}
 		}
-		if err := ollama.SetModel(chosen); err != nil {
+		if err := cat.SetModel(chosen); err != nil {
 			return fmt.Sprintf("❌ 切換模型失敗: %v", err), true
 		}
-		a.cfg.LLM.Ollama.Model = chosen
-		if err := llm.SaveModelState(a.cfg.Sandbox.StateDir, llm.ModelState{OllamaModel: chosen}); err != nil {
-			return fmt.Sprintf("✅ 已切換 Ollama 模型為 `%s`，但沒能寫入重啟記錄：%v", chosen, err), true
+		llm.AssignConfigModel(a.cfg, cat.Name(), chosen)
+		if err := llm.PersistModelChoice(a.cfg.Sandbox.StateDir, cat.Name(), chosen); err != nil {
+			return fmt.Sprintf("✅ 已切換 %s 模型為 `%s`，但沒能寫入重啟記錄：%v", cat.Name(), chosen, err), true
 		}
 		note := ""
 		if listErr != nil {
-			note = fmt.Sprintf("\n（未能核對本機清單：%v）", listErr)
+			note = fmt.Sprintf("\n（未能核對模型清單：%v）", listErr)
+		} else if src := llm.CatalogNote(cat); src != "" {
+			note = "\n（" + src + "）"
 		}
-		a.recordAction(fmt.Sprintf("Switched Ollama model to %s", chosen))
-		log.Info().Str("model", chosen).Msg("Switched Ollama model")
-		return fmt.Sprintf("✅ 已切換 Ollama 模型為 `%s`。重啟後仍會使用這個模型。%s", chosen, note), true
+		a.recordAction(fmt.Sprintf("Switched %s model to %s", cat.Name(), chosen))
+		log.Info().Str("provider", cat.Name()).Str("model", chosen).Msg("Switched model")
+		return fmt.Sprintf("✅ 已切換 %s 模型為 `%s`。重啟後仍會使用這個模型。%s", cat.Name(), chosen, note), true
 
 	case "/pending":
 		pending := a.evolveEngine.ListPending()

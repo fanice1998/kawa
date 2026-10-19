@@ -35,6 +35,29 @@ func TestOllamaModelSwitchPersists(t *testing.T) {
 	}
 }
 
+func TestPersistProviderAndModelKeepsOthers(t *testing.T) {
+	dir := t.TempDir()
+	if err := SaveModelState(dir, ModelState{OllamaModel: "qwen3.6:27b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := PersistActiveProvider(dir, "grok_oauth"); err != nil {
+		t.Fatal(err)
+	}
+	if err := PersistModelChoice(dir, "grok_oauth", "grok-4"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadModelState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ActiveProvider != "grok_oauth" || loaded.OllamaModel != "qwen3.6:27b" || loaded.ModelOf("grok_oauth") != "grok-4" {
+		t.Fatalf("loaded %#v", loaded)
+	}
+	if loaded.ModelOf("ollama") != "qwen3.6:27b" {
+		t.Fatalf("ollama model dropped: %#v", loaded)
+	}
+}
+
 func TestResolveOllamaModel(t *testing.T) {
 	available := []string{"qwen3.6:27b", "qwen2.5-coder:14b"}
 	got, err := ResolveOllamaModel("qwen2.5-coder", available)

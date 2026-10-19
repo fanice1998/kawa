@@ -7,13 +7,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fanice1998/kawa/internal/config"
 )
 
 type ClaudeProvider struct {
+	mu        sync.RWMutex
 	baseURL   string
 	apiKey    string
 	model     string
@@ -45,8 +48,68 @@ func NewClaudeProvider(cfg config.ClaudeConfig) *ClaudeProvider {
 	}
 }
 
-func (p *ClaudeProvider) Name() string  { return "claude" }
-func (p *ClaudeProvider) Model() string { return p.model }
+func (p *ClaudeProvider) Name() string { return "claude" }
+
+func (p *ClaudeProvider) Model() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.model
+}
+
+func (p *ClaudeProvider) SetModel(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("model name is empty")
+	}
+	p.mu.Lock()
+	p.model = name
+	p.mu.Unlock()
+	return nil
+}
+
+// ListModels calls GET {baseURL}/models and follows after_id pages.
+func (p *ClaudeProvider) ListModels(ctx context.Context) ([]ListedModel, error) {
+	var all []ListedModel
+	after := ""
+	for page := 0; page < 5; page++ {
+		q := url.Values{}
+		q.Set("limit", "100")
+		if after != "" {
+			q.Set("after_id", after)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/models?"+q.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("x-api-key", p.apiKey)
+		req.Header.Set("anthropic-version", p.version)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := p.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("claude list models: %w", err)
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("claude list models HTTP %d: %s", resp.StatusCode, clipBody(body))
+		}
+		env, models, err := decodeModelPage(body, false)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, models...)
+		next := strings.TrimSpace(env.LastID)
+		if next == "" && len(env.Data) > 0 {
+			next = env.Data[len(env.Data)-1].listedID()
+		}
+		if !env.HasMore || next == "" || next == after {
+			break
+		}
+		after = next
+	}
+	return dedupeListed(all), nil
+}
 
 type claudeReq struct {
 	Model     string          `json:"model"`
@@ -82,6 +145,7 @@ type claudeResp struct {
 }
 
 func (p *ClaudeProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	model := p.Model()
 	var systemParts []string
 	var msgs []claudeMessage
 
@@ -142,7 +206,7 @@ func (p *ClaudeProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	}
 
 	payload, err := json.Marshal(claudeReq{
-		Model:     p.model,
+		Model:     model,
 		MaxTokens: p.maxTokens,
 		System:    strings.Join(systemParts, "\n\n"),
 		Messages:  msgs,
@@ -178,7 +242,7 @@ func (p *ClaudeProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 
 	out := &ChatResponse{
 		Provider: p.Name(),
-		Model:    p.model,
+		Model:    model,
 	}
 	var textParts []string
 	for _, b := range cResp.Content {

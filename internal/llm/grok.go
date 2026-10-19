@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fanice1998/kawa/internal/config"
@@ -15,12 +17,15 @@ import (
 
 // GrokProvider implements both `xai_grok` (API Key) and `grok_oauth` (OAuth2 with auto-refresh).
 type GrokProvider struct {
-	name     string
-	baseURL  string
-	model    string
-	apiKey   string
-	oauthMgr *OAuthTokenManager
-	client   *http.Client
+	mu          sync.RWMutex
+	name        string
+	baseURL     string
+	model       string
+	apiKey      string
+	oauthMgr    *OAuthTokenManager
+	client      *http.Client
+	modelsCache string
+	listNote    string
 }
 
 func NewGrokAPIKeyProvider(cfg config.APIKeyModelConfig) *GrokProvider {
@@ -51,8 +56,24 @@ func NewGrokOAuthProvider(cfg config.OAuthModelConfig) *GrokProvider {
 	}
 }
 
-func (p *GrokProvider) Name() string  { return p.name }
-func (p *GrokProvider) Model() string { return p.model }
+func (p *GrokProvider) Name() string { return p.name }
+
+func (p *GrokProvider) Model() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.model
+}
+
+func (p *GrokProvider) SetModel(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("model name is empty")
+	}
+	p.mu.Lock()
+	p.model = name
+	p.mu.Unlock()
+	return nil
+}
 
 type openAIChatReq struct {
 	Model    string          `json:"model"`
@@ -94,6 +115,7 @@ type openAIChatResp struct {
 }
 
 func (p *GrokProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	model := p.Model()
 	msgs := make([]openAIMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		om := openAIMessage{
@@ -125,7 +147,7 @@ func (p *GrokProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	}
 
 	payload, err := json.Marshal(openAIChatReq{
-		Model:    p.model,
+		Model:    model,
 		Messages: msgs,
 		Tools:    tools,
 	})
@@ -161,7 +183,7 @@ func (p *GrokProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	out := &ChatResponse{
 		Content:  choice.Content,
 		Provider: p.Name(),
-		Model:    p.model,
+		Model:    model,
 	}
 	for _, tc := range choice.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, ToolCall{
@@ -173,18 +195,107 @@ func (p *GrokProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	return out, nil
 }
 
-func (p *GrokProvider) doRequest(ctx context.Context, payload []byte, forceRefresh bool) ([]byte, int, error) {
-	token := p.apiKey
-	if p.oauthMgr != nil {
-		var err error
-		if forceRefresh {
-			token, err = p.oauthMgr.ForceRefresh(ctx)
-		} else {
-			token, err = p.oauthMgr.GetToken(ctx)
-		}
+// ListModels reads ~/.grok/models_cache.json when that file has models.
+// If the local cache is missing, it asks the xAI API:
+// GET {baseURL}/language-models, then GET {baseURL}/models on 404.
+func (p *GrokProvider) ListModels(ctx context.Context) ([]ListedModel, error) {
+	cached, cacheErr := loadGrokModelsCache(p.modelsCache)
+	if cacheErr == nil && len(cached) > 0 {
+		p.setListNote(grokModelsCacheNote)
+		return cached, nil
+	}
+	models, err := p.listModelsFromAPI(ctx)
+	if err == nil {
+		p.setListNote("")
+		return models, nil
+	}
+	p.setListNote("")
+	if cacheErr != nil && !os.IsNotExist(cacheErr) {
+		return nil, fmt.Errorf("%w（本機模型快取也讀不到：%v）", err, cacheErr)
+	}
+	return nil, err
+}
+
+func (p *GrokProvider) ListNote() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.listNote
+}
+
+func (p *GrokProvider) setListNote(note string) {
+	p.mu.Lock()
+	p.listNote = note
+	p.mu.Unlock()
+}
+
+func (p *GrokProvider) listModelsFromAPI(ctx context.Context) ([]ListedModel, error) {
+	body, status, err := p.getJSON(ctx, "/language-models")
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNotFound {
+		body, status, err = p.getJSON(ctx, "/models")
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("%s list models HTTP %d: %s", p.name, status, clipBody(body))
+	}
+	_, models, err := decodeModelPage(body, false)
+	if err != nil {
+		return nil, err
+	}
+	return dedupeListed(models), nil
+}
+
+func (p *GrokProvider) bearerToken(ctx context.Context, forceRefresh bool) (string, error) {
+	if p.oauthMgr == nil {
+		return p.apiKey, nil
+	}
+	if forceRefresh {
+		return p.oauthMgr.ForceRefresh(ctx)
+	}
+	return p.oauthMgr.GetToken(ctx)
+}
+
+func (p *GrokProvider) getJSON(ctx context.Context, path string) ([]byte, int, error) {
+	body, status, err := p.doGET(ctx, path, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	if status == http.StatusUnauthorized && p.oauthMgr != nil {
+		return p.doGET(ctx, path, true)
+	}
+	return body, status, nil
+}
+
+func (p *GrokProvider) doGET(ctx context.Context, path string, forceRefresh bool) ([]byte, int, error) {
+	token, err := p.bearerToken(ctx, forceRefresh)
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+path, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s list models: %w", p.name, err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	return body, resp.StatusCode, nil
+}
+
+func (p *GrokProvider) doRequest(ctx context.Context, payload []byte, forceRefresh bool) ([]byte, int, error) {
+	token, err := p.bearerToken(ctx, forceRefresh)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
